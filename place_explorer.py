@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PlaceExplorer — version GitHub Actions
+PlaceExplorer - version GitHub Actions
 - Lit la localisation et le mois depuis les variables d'environnement (inputs du workflow)
 - Génère l'Excel multi-feuilles (31 catégories, top 20 lieux triés par nombre d'avis)
 - Envoie un email HTML stylé depuis romtaug@gmail.com avec l'Excel (+ images si présentes) en pièce jointe
@@ -28,7 +28,7 @@ from email import encoders
 from openpyxl import load_workbook
 
 # ----------------------------------------------------------------------------
-# Configuration (depuis l'environnement — injecté par le workflow)
+# Configuration (depuis l'environnement - injecté par le workflow)
 # ----------------------------------------------------------------------------
 API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
@@ -344,7 +344,7 @@ def create_excel_file(api_key, location, vacation_month):
 
 
 # ----------------------------------------------------------------------------
-# Email HTML (même contenu, même liens — juste stylé)
+# Email HTML (même contenu, même liens - juste stylé)
 # ----------------------------------------------------------------------------
 def build_email_bodies(location, location_cleaned, vacation_month_cleaned):
     ia_prompt = (
@@ -537,7 +537,7 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
       </td></tr>
     </table>
     <div style="text-align:center;margin-top:16px;">
-      {btn(claude_url, 'Ouvrir Claude — prompt pré-rempli')}
+      {btn(claude_url, 'Ouvrir Claude - prompt pré-rempli')}
     </div>
   </td></tr>
 
@@ -558,7 +558,7 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
     {small_btn('https://bordeuroconnect.netlify.app/', 'BordEuro Connect')}
     <p style="margin:18px 0 0;font-size:11.5px;color:{MUTED};line-height:1.6;">
       Vous recevez cet e-mail car un guide Place&nbsp;Explorer a été généré pour vous.<br>
-      Place&nbsp;Explorer — Guide de voyage automatisé
+      Place&nbsp;Explorer - Guide de voyage automatisé
     </p>
   </td></tr>
 
@@ -655,7 +655,7 @@ if __name__ == "__main__":
     wb_check.close()
     print(f"📊 Total : {total_rows} lieux dans {len(wb_check.sheetnames)} feuilles")
     if total_rows == 0:
-        print("❌ Le fichier Excel est vide (0 lieu) — envoi annulé.")
+        print("❌ Le fichier Excel est vide (0 lieu) - envoi annulé.")
         print("   Causes probables : statut API en erreur (voir ⚠️ ci-dessus) ou filtre pays trop strict.")
         sys.exit(1)
 
