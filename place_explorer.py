@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PlaceExplorer - version GitHub Actions
+PlaceExplorer — version GitHub Actions
 - Lit la localisation et le mois depuis les variables d'environnement (inputs du workflow)
 - Génère l'Excel multi-feuilles (31 catégories, top 20 lieux triés par nombre d'avis)
 - Envoie un email HTML stylé depuis romtaug@gmail.com avec l'Excel (+ images si présentes) en pièce jointe
@@ -28,7 +28,7 @@ from email import encoders
 from openpyxl import load_workbook
 
 # ----------------------------------------------------------------------------
-# Configuration (depuis l'environnement - injecté par le workflow)
+# Configuration (depuis l'environnement — injecté par le workflow)
 # ----------------------------------------------------------------------------
 API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
@@ -344,7 +344,7 @@ def create_excel_file(api_key, location, vacation_month):
 
 
 # ----------------------------------------------------------------------------
-# Email HTML (même contenu, même liens - juste stylé)
+# Email HTML (même contenu, même liens — juste stylé)
 # ----------------------------------------------------------------------------
 def build_email_bodies(location, location_cleaned, vacation_month_cleaned):
     ia_prompt = (
@@ -354,6 +354,9 @@ def build_email_bodies(location, location_cleaned, vacation_month_cleaned):
         "(documents, visas, vaccins), les précautions à prendre (arnaques, numéros d'urgence), les coûts approximatifs, "
         "la météo moyenne, les événements locaux, et des astuces pour se déplacer, respecter les coutumes, et profiter au maximum."
     )
+
+    import urllib.parse as _up
+    claude_url_plain = "https://claude.ai/new?q=" + _up.quote(ia_prompt)
 
     # --- Version texte brut (fallback, identique à l'originale) ---
     body_plain = f"""Bienvenue à bord de Place Explorer !
@@ -378,7 +381,7 @@ Découvrez {location} ! C'est une destination rêvée pour des aventures inoubli
     - 📞 Pour trouver des eSIM à moindre coût à l'étranger : https://www.airalo.com/fr
     - 💳 Pour dépenser sans aucuns frais de change et gagner 200 € à l'ouverture : https://revolut.com/referral/?referral-code=romainavh3!DEC1-24-VR-FR
 
-🤖 Copiez ce prompt sur https://claude.ai pour enrichir votre expérience :
+🤖 Ouvrez ce lien pour lancer le prompt ci-dessous dans Claude (déjà pré-rempli, appuyez juste sur Entrée) : {claude_url_plain}\n\nOu copiez-le manuellement sur https://claude.ai :
 
 "{ia_prompt}"
 
@@ -425,6 +428,10 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
 
     preheader = (f"Votre guide de voyage personnalisé pour {location} : lieux incontournables, "
                  f"plan d'organisation et liens utiles.")
+
+    # URL Claude avec le prompt pré-rempli dans la zone de saisie (le destinataire n'a plus qu'à appuyer sur Entrée)
+    import urllib.parse
+    claude_url = "https://claude.ai/new?q=" + urllib.parse.quote(ia_prompt)
 
     body_html = f"""\
 <!DOCTYPE html>
@@ -522,7 +529,7 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
   <tr><td style="padding:26px 36px 8px;">
     {section_title('Assistant IA', 'Enrichissez votre expérience')}
     <p style="margin:0 0 12px;font-size:14px;color:{TEXT};line-height:1.6;">
-      Copiez ce prompt sur <strong>Claude</strong> pour obtenir un programme complet et personnalisé&nbsp;:
+      Cliquez sur le bouton ci-dessous&nbsp;: <strong>Claude</strong> s'ouvre avec ce prompt déjà saisi, il ne reste qu'à appuyer sur Entrée pour obtenir un programme complet et personnalisé&nbsp;:
     </p>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color:#f8f9fa;border-left:4px solid {NAVY};border-radius:0 8px 8px 0;">
       <tr><td style="padding:16px 18px;">
@@ -530,7 +537,7 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
       </td></tr>
     </table>
     <div style="text-align:center;margin-top:16px;">
-      {btn('https://claude.ai', 'Ouvrir Claude')}
+      {btn(claude_url, 'Ouvrir Claude — prompt pré-rempli')}
     </div>
   </td></tr>
 
@@ -551,7 +558,7 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
     {small_btn('https://bordeuroconnect.netlify.app/', 'BordEuro Connect')}
     <p style="margin:18px 0 0;font-size:11.5px;color:{MUTED};line-height:1.6;">
       Vous recevez cet e-mail car un guide Place&nbsp;Explorer a été généré pour vous.<br>
-      Place&nbsp;Explorer - Guide de voyage automatisé
+      Place&nbsp;Explorer — Guide de voyage automatisé
     </p>
   </td></tr>
 
@@ -648,7 +655,7 @@ if __name__ == "__main__":
     wb_check.close()
     print(f"📊 Total : {total_rows} lieux dans {len(wb_check.sheetnames)} feuilles")
     if total_rows == 0:
-        print("❌ Le fichier Excel est vide (0 lieu) - envoi annulé.")
+        print("❌ Le fichier Excel est vide (0 lieu) — envoi annulé.")
         print("   Causes probables : statut API en erreur (voir ⚠️ ci-dessus) ou filtre pays trop strict.")
         sys.exit(1)
 
