@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PlaceExplorer - version GitHub Actions
+PlaceExplorer — version GitHub Actions
 - Lit la localisation et le mois depuis les variables d'environnement (inputs du workflow)
 - Génère l'Excel multi-feuilles (31 catégories, top 20 lieux triés par nombre d'avis)
 - Envoie un email HTML stylé depuis romtaug@gmail.com avec l'Excel (+ images si présentes) en pièce jointe
@@ -28,7 +28,7 @@ from email import encoders
 from openpyxl import load_workbook
 
 # ----------------------------------------------------------------------------
-# Configuration (depuis l'environnement - injecté par le workflow)
+# Configuration (depuis l'environnement — injecté par le workflow)
 # ----------------------------------------------------------------------------
 API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
@@ -106,6 +106,7 @@ def get_place_details(place_id, api_key):
     details_params = {
         'place_id': place_id,
         'fields': 'name,formatted_address,rating,user_ratings_total,price_level,international_phone_number,website',
+        'language': 'en',
         'key': api_key
     }
     response = requests.get(details_url, params=details_params, timeout=30)
@@ -117,13 +118,18 @@ def get_place_details(place_id, api_key):
 
 def search_places(api_key, location, category):
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    params = {'query': f'{category} in {location}', 'key': api_key}
+    params = {'query': f'{category} in {location}', 'language': 'en', 'key': api_key}
 
     response = requests.get(url, params=params, timeout=30)
     if response.status_code != 200:
         print(f"Erreur {response.status_code} lors de la récupération des données pour {category}")
         return []
-    places = response.json().get('results', [])[:20]  # top 20 de la 1ère page
+    payload = response.json()
+    api_status = payload.get('status', 'UNKNOWN')
+    if api_status not in ('OK', 'ZERO_RESULTS'):
+        print(f"⚠️ API status '{api_status}' pour {category} : {payload.get('error_message', 'pas de détail')}")
+        return []
+    places = payload.get('results', [])[:20]  # top 20 de la 1ère page
 
     detailed_places = []
     for place in places:
@@ -141,8 +147,7 @@ def search_places(api_key, location, category):
                 'Rating (on 5)': details.get('rating', 'Not rated'),
                 'Price Level': {0: "Free", 1: "+", 2: "++", 3: "+++", 4: "++++"}.get(
                     details.get('price_level', None), 'Not specified'),
-                'Maps': f'=HYPERLINK("https://www.google.com/maps/place/?q=place_id:{place_id}", '
-                        f'"https://www.google.com/maps/place/?q=place_id:{place_id}")',
+                'Maps': f'=HYPERLINK("https://www.google.com/maps/place/?q=place_id:{place_id}", "📍 Google Maps")',
                 'Phone': details.get('international_phone_number', 'Not available')
             })
         time.sleep(0.05)
@@ -169,6 +174,86 @@ def adjust_column_width(file_path):
     wb.save(file_path)
 
 
+
+def style_workbook(file_path):
+    """
+    Stylise tout le classeur : en-têtes navy, lignes alternées, filtres,
+    volet figé, liens Maps en bleu, formats de nombres, largeurs ajustées.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    NAVY = "1F3B63"
+    BAND = "F3F6FA"
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color=NAVY, end_color=NAVY, fill_type="solid")
+    band_fill = PatternFill(start_color=BAND, end_color=BAND, fill_type="solid")
+    body_font = Font(name="Calibri", size=10.5, color="3C4043")
+    link_font = Font(name="Calibri", size=10.5, color="1A73E8", underline="single", bold=True)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center", wrap_text=False)
+    thin_border = Border(bottom=Side(style="thin", color="E0E5EA"))
+
+    wb = load_workbook(file_path)
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        if ws.max_row < 1:
+            continue
+
+        headers = [c.value for c in ws[1]]
+        col_idx = {h: i + 1 for i, h in enumerate(headers)}
+
+        # En-tête
+        ws.row_dimensions[1].height = 24
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+
+        # Corps
+        for r, row in enumerate(ws.iter_rows(min_row=2), start=2):
+            for cell in row:
+                cell.font = body_font
+                cell.border = thin_border
+                cell.alignment = left
+                if r % 2 == 0:
+                    cell.fill = band_fill
+            # Colonnes spécifiques
+            if 'Total Reviews' in col_idx:
+                c = ws.cell(row=r, column=col_idx['Total Reviews'])
+                c.number_format = '#,##0'
+                c.alignment = center
+            for name in ('Rating (on 5)', 'Price Level', 'City'):
+                if name in col_idx:
+                    ws.cell(row=r, column=col_idx[name]).alignment = center
+            if 'Maps' in col_idx:
+                c = ws.cell(row=r, column=col_idx['Maps'])
+                c.font = link_font
+                c.alignment = center
+
+        # Volet figé + filtres
+        ws.freeze_panes = "A2"
+        if ws.max_row >= 2:
+            ws.auto_filter.ref = ws.dimensions
+
+        # Largeurs : basées sur le contenu, libellé fixe pour Maps, bornées
+        for i, col in enumerate(ws.columns, start=1):
+            letter = get_column_letter(i)
+            header = headers[i - 1] if i - 1 < len(headers) else ""
+            if header == 'Maps':
+                ws.column_dimensions[letter].width = 18
+                continue
+            max_length = len(str(header or ""))
+            for cell in col:
+                if cell.row == 1 or cell.value is None:
+                    continue
+                max_length = max(max_length, len(str(cell.value)))
+            ws.column_dimensions[letter].width = max(12, min(max_length + 3, 55))
+
+    wb.save(file_path)
+    print(f"✅ Classeur stylisé : {file_path}")
+
+
 def remove_invalid_rows(file_path, location):
     country = location.split(",")[-1].strip()
     print(f"Filtrage des lignes se terminant par : {country}")
@@ -180,7 +265,7 @@ def remove_invalid_rows(file_path, location):
             cell = row[1]  # colonne Address
             if cell.value and isinstance(cell.value, str):
                 cell_value_normalized = " ".join(cell.value.split())
-                if not cell_value_normalized.endswith(country):
+                if not cell_value_normalized.lower().endswith(country.lower()):
                     rows_to_delete.append(cell.row)
         for row_idx in sorted(set(rows_to_delete), reverse=True):
             ws.delete_rows(row_idx)
@@ -259,7 +344,7 @@ def create_excel_file(api_key, location, vacation_month):
 
 
 # ----------------------------------------------------------------------------
-# Email HTML (même contenu, même liens - juste stylé)
+# Email HTML (même contenu, même liens — juste stylé)
 # ----------------------------------------------------------------------------
 def build_email_bodies(location, location_cleaned, vacation_month_cleaned):
     ia_prompt = (
@@ -466,7 +551,7 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
     {small_btn('https://bordeuroconnect.netlify.app/', 'BordEuro Connect')}
     <p style="margin:18px 0 0;font-size:11.5px;color:{MUTED};line-height:1.6;">
       Vous recevez cet e-mail car un guide Place&nbsp;Explorer a été généré pour vous.<br>
-      Place&nbsp;Explorer - Guide de voyage automatisé
+      Place&nbsp;Explorer — Guide de voyage automatisé
     </p>
   </td></tr>
 
@@ -539,7 +624,7 @@ if __name__ == "__main__":
     try:
         excel_file, location, vacation_month = create_excel_file(API_KEY, LOCATION, VACATION_MONTH)
         remove_invalid_rows(excel_file, location)
-        adjust_column_width(excel_file)
+        style_workbook(excel_file)
     except SystemExit:
         raise
     except Exception as e:
@@ -551,6 +636,20 @@ if __name__ == "__main__":
 
     if not os.path.exists(excel_file):
         print(f"❌ Le fichier Excel n'a pas été trouvé : {excel_file}")
+        sys.exit(1)
+
+    # Garde-fou : vérifier que l'Excel contient des données avant d'envoyer
+    wb_check = load_workbook(excel_file, read_only=True)
+    total_rows = 0
+    for sheet_name in wb_check.sheetnames:
+        n = sum(1 for _ in wb_check[sheet_name].iter_rows(min_row=2))
+        total_rows += n
+        print(f"   📄 {sheet_name} : {n} lieux")
+    wb_check.close()
+    print(f"📊 Total : {total_rows} lieux dans {len(wb_check.sheetnames)} feuilles")
+    if total_rows == 0:
+        print("❌ Le fichier Excel est vide (0 lieu) — envoi annulé.")
+        print("   Causes probables : statut API en erreur (voir ⚠️ ci-dessus) ou filtre pays trop strict.")
         sys.exit(1)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
