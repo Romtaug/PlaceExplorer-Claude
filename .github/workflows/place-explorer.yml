@@ -1,0 +1,52 @@
+name: 🌍 Place Explorer
+
+on:
+  workflow_dispatch:
+    inputs:
+      location:
+        description: "Destination (format : Ville, Pays — ou juste Pays)"
+        required: true
+        default: "Lisbonne, Portugal"
+      vacation_month:
+        description: "Mois de vacances (ex : Août, 2026)"
+        required: true
+        default: "Août, 2026"
+      receiver_emails:
+        description: "Destinataires (séparés par des virgules)"
+        required: false
+        default: "romtaug@gmail.com"
+
+jobs:
+  place-explorer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: pip install requests pandas openpyxl
+
+      - name: 🚀 Run Place Explorer
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          LOCATION: ${{ inputs.location }}
+          VACATION_MONTH: ${{ inputs.vacation_month }}
+          RECEIVER_EMAILS: ${{ inputs.receiver_emails }}
+        run: python place_explorer.py
+
+      - name: 📤 Upload Excel as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: place-explorer-excel
+          path: Content/*.xlsx
+          if-no-files-found: warn
+          retention-days: 30
