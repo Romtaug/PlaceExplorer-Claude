@@ -416,7 +416,7 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
               small_btn('https://www.tripadvisor.com', 'Tripadvisor'))}
       {useful('Activités locales', "Réservez des visites et expériences sur place.",
               small_btn('https://www.getyourguide.fr/', 'GetYourGuide'))}
-      {useful('Connexion à l\'étranger', "Trouvez des eSIM à moindre coût pour rester connecté.",
+      {useful("Connexion à l'étranger", "Trouvez des eSIM à moindre coût pour rester connecté.",
               small_btn('https://www.airalo.com/fr', 'Airalo'))}
     </table>
   </td></tr>
