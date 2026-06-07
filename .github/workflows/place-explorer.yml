@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       location:
-        description: "Destination (format : Ville, Pays — ou juste Pays)"
+        description: "Destination EN ANGLAIS (ex : Lisbon, Portugal — le pays anglais est obligatoire)"
         required: true
-        default: "Lisbonne, Portugal"
+        default: "Lisbon, Portugal"
       vacation_month:
-        description: "Mois de vacances (ex : Août, 2026)"
+        description: "Mois de vacances, français accepté (ex : Août, 2026)"
         required: true
         default: "Août, 2026"
       receiver_emails:
