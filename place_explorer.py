@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PlaceExplorer — version GitHub Actions
+PlaceExplorer - version GitHub Actions
 - Lit la localisation et le mois depuis les variables d'environnement (inputs du workflow)
 - Génère l'Excel multi-feuilles (31 catégories, top 20 lieux triés par nombre d'avis)
 - Envoie un email HTML stylé depuis romtaug@gmail.com avec l'Excel (+ images si présentes) en pièce jointe
@@ -28,7 +28,7 @@ from email import encoders
 from openpyxl import load_workbook
 
 # ----------------------------------------------------------------------------
-# Configuration (depuis l'environnement — injecté par le workflow)
+# Configuration (depuis l'environnement - injecté par le workflow)
 # ----------------------------------------------------------------------------
 API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
@@ -259,7 +259,7 @@ def create_excel_file(api_key, location, vacation_month):
 
 
 # ----------------------------------------------------------------------------
-# Email HTML (même contenu, même liens — juste stylé)
+# Email HTML (même contenu, même liens - juste stylé)
 # ----------------------------------------------------------------------------
 def build_email_bodies(location, location_cleaned, vacation_month_cleaned):
     ia_prompt = (
@@ -466,7 +466,7 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
     {small_btn('https://bordeuroconnect.netlify.app/', 'BordEuro Connect')}
     <p style="margin:18px 0 0;font-size:11.5px;color:{MUTED};line-height:1.6;">
       Vous recevez cet e-mail car un guide Place&nbsp;Explorer a été généré pour vous.<br>
-      Place&nbsp;Explorer — Guide de voyage automatisé
+      Place&nbsp;Explorer - Guide de voyage automatisé
     </p>
   </td></tr>
 
