@@ -370,7 +370,7 @@ Découvrez {location} ! C'est une destination rêvée pour des aventures inoubli
     2. Consultez chaque feuille pour explorer les meilleurs options par catégorie
     3. Planifiez vos activités (par exemple 2/jours par feuille) sur : https://www.google.com/mymaps un calque par ville
     4. Si le réseau est payant à l’étranger, utilisez Google Maps hors connexion : https://support.google.com/maps/answer/6291838?hl=fr
-    5. Envoyez-vous votre parcours du jour (en fonction de la proximité) sur WhatsApp ou via Google Docs pour le garder à portée de main sur votre téléphone : https://web.whatsapp.com, https://wa.me, ou https://docs.google.com
+    5. Envoyez-vous votre parcours du jour (en fonction de la proximité) sur WhatsApp ou via Google Docs pour le garder à portée de main sur votre téléphone : https://web.whatsapp.com ou https://docs.google.com
 
 🌍 Liens utiles :
     - ✈ Pour trouver les vols les moins chers et obtenir des indemnisations en cas de retard : https://www.skyscanner.fr/ ou https://www.airhelp.com/fr/
@@ -379,7 +379,7 @@ Découvrez {location} ! C'est une destination rêvée pour des aventures inoubli
     - 🖍 Pour des avis et recommandations : https://www.tripadvisor.com
     - 🗺 Pour réserver des activités locales : https://www.getyourguide.fr/
     - 📞 Pour trouver des eSIM à moindre coût à l'étranger : https://www.airalo.com/fr
-    - 💳 Pour dépenser sans aucuns frais de change et gagner 200 € à l'ouverture : https://revolut.com/referral/?referral-code=romainavh3!DEC1-24-VR-FR
+    - 💳 Pour dépenser sans frais de change à l'étranger, ouvrez un compte Revolut : https://revolut.com/referral/?referral-code=romainavh3!DEC1-24-VR-FR
 
 🤖 Ouvrez ce lien pour lancer le prompt ci-dessous dans Claude (déjà pré-rempli, appuyez juste sur Entrée) : {claude_url_plain}\n\nOu copiez-le manuellement sur https://claude.ai :
 
@@ -489,7 +489,6 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
             small_btn('https://support.google.com/maps/answer/6291838?hl=fr', 'Maps hors connexion'))}
       {step('5', "Envoyez-vous votre parcours du jour (en fonction de la proximité) pour le garder à portée de main sur votre téléphone&nbsp;:",
             small_btn('https://web.whatsapp.com', 'WhatsApp Web') +
-            small_btn('https://wa.me', 'wa.me') +
             small_btn('https://docs.google.com', 'Google Docs'))}
     </table>
   </td></tr>
@@ -518,8 +517,8 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color:{NAVY};border-radius:12px;">
       <tr><td style="padding:24px 26px;text-align:center;">
         <p style="margin:0 0 4px;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#9fb3d1;">Offre partenaire</p>
-        <p style="margin:0 0 6px;font-size:17px;font-weight:700;color:#ffffff;">Dépensez sans aucuns frais de change</p>
-        <p style="margin:0 0 14px;font-size:13.5px;color:#d7e0ec;line-height:1.55;">et gagnez 200&nbsp;€ à l'ouverture de votre compte.</p>
+        <p style="margin:0 0 6px;font-size:17px;font-weight:700;color:#ffffff;">Dépensez sans frais de change à l'étranger</p>
+        <p style="margin:0 0 14px;font-size:13.5px;color:#d7e0ec;line-height:1.55;">Ouvrez un compte Revolut en quelques minutes.</p>
         {btn('https://revolut.com/referral/?referral-code=romainavh3!DEC1-24-VR-FR', 'Ouvrir un compte Revolut', RED)}
       </td></tr>
     </table>
