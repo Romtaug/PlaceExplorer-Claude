@@ -358,7 +358,7 @@ def _fmt_dur(s):
 
 
 def describe(seq):
-    return "\n".join(f"{i}. {s.get('_step','•')} - {s.get('Name','?')}"
+    return "\n".join(f"{i}. {s.get('_step','•')} {s.get('Name','?')}"
                      for i, s in enumerate(seq, 1))
 
 
@@ -375,9 +375,21 @@ def place_url(s):
             + urllib.parse.quote(str(s.get("Name", ""))))
 
 
+def streetview_url(s):
+    """Lien Google Street View (vue panoramique) à l'emplacement du lieu."""
+    c = _coords(s)
+    if c:
+        return (f"https://www.google.com/maps/@?api=1&map_action=pano"
+                f"&viewpoint={c[0]},{c[1]}")
+    return place_url(s)
+
+
 def _meta(s):
-    """'★ 4.6 · 12 345 avis · ++' à partir des champs de l'Excel (gère les manquants)."""
+    """'Parc · ★ 4.6 · 12 345 avis · ++' (catégorie incluse, gère les manquants)."""
     bits = []
+    cat = s.get("_category")
+    if cat and str(cat) not in ("None", ""):
+        bits.append(str(cat))
     try:
         bits.append(f"\u2605 {float(s.get('Rating (on 5)')):.1f}")
     except (TypeError, ValueError):
@@ -439,14 +451,15 @@ def itinerary_plain_block(itin):
         lines.append("    " + " · ".join(infos))
         lines.append("")
     for i, s in enumerate(itin["sequence"], 1):
-        lines.append(f"    {i}. {s.get('_step','')} - {s.get('Name','')}")
+        lines.append(f"    {i}. {s.get('_step','')} {s.get('Name','')}")
         meta = _meta(s)
         if meta:
             lines.append(f"       {meta}")
         addr = _addr(s)
         if addr:
             lines.append(f"       {addr}")
-        lines.append(f"       {place_url(s)}")
+        lines.append(f"       Maps : {place_url(s)}")
+        lines.append(f"       Street View : {streetview_url(s)}")
     lines += ["", f"    Ouvrir tout l'itinéraire dans Google Maps : {itin['url']}", ""]
     return "\n".join(lines)
 
@@ -470,13 +483,17 @@ def itinerary_email_block(itin):
             f'<tr><td style="padding:9px 0;border-bottom:1px solid #e6edf5;">'
             f'<table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr>'
             f'<td style="font-size:13.5px;color:{TEXT};vertical-align:middle;line-height:1.55;">'
-            f'<strong>{i}.</strong> {s.get("_step","")} - <strong>{s.get("Name","")}</strong>'
+            f'<strong>{i}.</strong> {s.get("_step","")} <strong>{s.get("Name","")}</strong>'
             f'{sub_html}</td>'
             f'<td align="right" style="vertical-align:middle;white-space:nowrap;padding-left:10px;">'
             f'<a href="{place_url(s)}" target="_blank" '
             f'style="display:inline-block;background:#eef2f8;color:{NAVY};padding:7px 13px;'
             f'border-radius:6px;text-decoration:none;font-weight:600;font-size:12px;'
-            f'border:1px solid #d7e0ec;">Maps</a></td>'
+            f'border:1px solid #d7e0ec;margin-bottom:5px;">Maps</a><br>'
+            f'<a href="{streetview_url(s)}" target="_blank" '
+            f'style="display:inline-block;background:#eef2f8;color:{NAVY};padding:7px 13px;'
+            f'border-radius:6px;text-decoration:none;font-weight:600;font-size:12px;'
+            f'border:1px solid #d7e0ec;">Street View</a></td>'
             f'</tr></table></td></tr>'
         )
     steps = "".join(rows)
