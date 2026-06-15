@@ -489,7 +489,7 @@ def itinerary_email_block(itin):
             f'<a href="{place_url(s)}" target="_blank" '
             f'style="display:inline-block;background:#eef2f8;color:{NAVY};padding:7px 13px;'
             f'border-radius:6px;text-decoration:none;font-weight:600;font-size:12px;'
-            f'border:1px solid #d7e0ec;margin-bottom:5px;">Maps</a><br>'
+            f'border:1px solid #d7e0ec;margin-right:6px;">Maps</a>'
             f'<a href="{streetview_url(s)}" target="_blank" '
             f'style="display:inline-block;background:#eef2f8;color:{NAVY};padding:7px 13px;'
             f'border-radius:6px;text-decoration:none;font-weight:600;font-size:12px;'
