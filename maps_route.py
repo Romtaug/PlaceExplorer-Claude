@@ -24,6 +24,15 @@ import requests
 # autour du déjeuner. Pas de plafond imposé : monte ce chiffre si tu veux.
 N_VISITS = 10
 
+# ── Garde-fou anti-lieu-excentré ────────────────────────────────────────────
+# L'API Places renvoie parfois des lieux ultra-populaires mais hors de portée
+# d'une journée à pied (Sintra à 25 km, Cabo da Roca à 40 km), voire des
+# résultats parasites carrément dans un autre pays. On écarte du PARCOURS À PIED
+# les lieux trop loin du cœur géographique (médiane des positions, robuste aux
+# outliers). N'affecte QUE l'itinéraire — l'Excel garde tous les lieux.
+# Mettre None pour désactiver (= pur populaire, sans filtre distance).
+MAX_KM_FROM_CORE = 5.0
+
 FOOD_CATEGORIES = {"restaurants"}
 BAR_CATEGORIES = {"bars", "nightclubs"}            # bar OU club, le plus populaire
 NON_TOURIST = {"airports", "train_stations", "hospitals",
@@ -93,6 +102,54 @@ def optimize_walking_order(stops, start=0):
 def _top(places, k=None):
     r = sorted(places, key=lambda d: d.get("Total Reviews", 0) or 0, reverse=True)
     return r[:k] if k else r
+
+
+def _dedup(places):
+    """Retire les doublons (même lieu présent dans plusieurs catégories de
+    l'Excel, ex. Castelo de São Jorge à la fois 'Sites historiques' et 'Musées').
+    Clé = PlaceID ; fallback nom + coords arrondies si PlaceID absent."""
+    seen, out = set(), []
+    for p in places:
+        key = p.get("PlaceID")
+        if not key:
+            c = _coords(p)
+            key = (p.get("Name"), round(c[0], 5), round(c[1], 5)) if c else p.get("Name")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _median(vals):
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return None
+    m = n // 2
+    return s[m] if n % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def _filter_walkable(groups, max_km):
+    """
+    Écarte les lieux trop loin du cœur géographique du groupe.
+    `groups` = liste de listes de lieux. Le cœur = médiane des positions de TOUS
+    les lieux (robuste : un lieu isolé à 1000 km ne déplace pas la médiane).
+    Renvoie les mêmes listes filtrées. Si max_km est None : ne filtre rien.
+    """
+    if not max_km:
+        return groups, None
+    pts = [_coords(p) for g in groups for p in g if _coords(p)]
+    if len(pts) < 3:                      # pas assez de points pour un cœur fiable
+        return groups, None
+    clat = _median([la for la, _ in pts])
+    clng = _median([lo for _, lo in pts])
+    max_m = max_km * 1000.0                # hav() renvoie des mètres
+    out = []
+    for g in groups:
+        out.append([p for p in g
+                    if _coords(p) and hav(clat, clng, *_coords(p)) <= max_m])
+    return out, (clat, clng)
 
 
 # ── Lien Google Maps : format "path" (prend TOUS les arrêts, sans plafond) ──
@@ -178,6 +235,22 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS, tra
                 continue
             else:
                 visits.append(p)
+
+    # Garde-fou : on retire du parcours à pied les lieux trop loin du cœur
+    # (Sintra, Cabo da Roca, résultats parasites à l'étranger...). L'Excel, lui,
+    # garde tout — ce filtre n'agit que sur l'itinéraire.
+    (visits, restos, bars), core = _filter_walkable([visits, restos, bars],
+                                                     MAX_KM_FROM_CORE)
+    if core and MAX_KM_FROM_CORE:
+        print(f"🚶 Garde-fou parcours : lieux gardés à ≤{MAX_KM_FROM_CORE:g} km "
+              f"du cœur ({core[0]:.4f}, {core[1]:.4f})")
+
+    # Dédup : un même lieu peut être dans plusieurs catégories de l'Excel.
+    visits, restos, bars = _dedup(visits), _dedup(restos), _dedup(bars)
+    # Et on évite qu'un lieu déjà classé en visite ressorte en repas/bar.
+    vids = {v.get("PlaceID") for v in visits if v.get("PlaceID")}
+    restos = [r for r in restos if r.get("PlaceID") not in vids]
+    bars = [b for b in bars if b.get("PlaceID") not in vids]
 
     visits = _top(visits, n_visits)
     if len(visits) < 2:
