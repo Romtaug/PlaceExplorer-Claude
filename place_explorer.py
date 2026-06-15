@@ -360,8 +360,8 @@ def create_excel_file(api_key, location, vacation_month):
 # ----------------------------------------------------------------------------
 def build_email_bodies(location, location_cleaned, vacation_month_cleaned, itinerary_block="", itinerary_plain=""):
     ia_prompt = (
-        f"Je cherche des expériences et activités extraordinaires à {location_cleaned} en {vacation_month_cleaned}, "
-        "fais un top 20 des incontournables durant cette période (événements, activités, monuments, restaurants, quartiers) "
+        f"Je cherche des expériences extraordinaires à {location_cleaned} en {vacation_month_cleaned}, "
+        "fais un top 20 des incontournables durant cette période (événements et activités) "
         "et un top 10 des villes à visiter autour avec le temps de trajet, indique les démarches administratives nécessaires "
         "(documents, visas, vaccins), les précautions à prendre (arnaques, numéros d'urgence), les coûts approximatifs, "
         "la météo moyenne, les événements locaux, et des astuces pour se déplacer, respecter les coutumes, et profiter au maximum."
