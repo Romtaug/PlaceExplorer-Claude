@@ -95,26 +95,29 @@ def _top(places, k=None):
     return r[:k] if k else r
 
 
-# ── Lien Google Maps (api=1, marche, place_id fiables) ────────────
+# ── Lien Google Maps : format "path" (prend TOUS les arrêts, sans plafond) ──
+# Même approche que tour_url de thermodata_engine : .../dir/A/B/C/...
+# Le format api=1 plafonne à ~9 waypoints (tronque au-delà) ; le format path
+# avale toute la liste. Adresse de préférence (lisible), sinon coordonnées.
 def _loc(s):
-    return s.get("Address") or s.get("Name") or ""
+    if s.get("Address"):
+        return urllib.parse.quote(str(s["Address"]).strip())
+    c = _coords(s)
+    if c:
+        return f"{c[0]},{c[1]}"
+    return urllib.parse.quote(str(s.get("Name", "")).strip())
 
 
 def build_route_url(stops, travelmode="walking"):
-    stops = [s for s in stops if _loc(s)]
+    stops = [s for s in stops if (s.get("Address") or s.get("Name") or _coords(s))]
     if len(stops) < 2:
         return None
-    o, d, mid = stops[0], stops[-1], stops[1:-1]
-    p = {"api": "1", "origin": _loc(o), "destination": _loc(d), "travelmode": travelmode}
-    if o.get("PlaceID"):
-        p["origin_place_id"] = o["PlaceID"]
-    if d.get("PlaceID"):
-        p["destination_place_id"] = d["PlaceID"]
-    if mid:
-        p["waypoints"] = "|".join(_loc(s) for s in mid)
-        if all(s.get("PlaceID") for s in mid):
-            p["waypoint_place_ids"] = "|".join(s["PlaceID"] for s in mid)
-    return "https://www.google.com/maps/dir/?" + urllib.parse.urlencode(p, quote_via=urllib.parse.quote_plus)
+    url = "https://www.google.com/maps/dir/" + "/".join(_loc(s) for s in stops)
+    # Mode de transport (suffixe interne Google) : 3e0 voiture, 3e1 vélo, 3e2 marche, 3e3 transports
+    modes = {"driving": "3e0", "bicycling": "3e1", "walking": "3e2", "transit": "3e3"}
+    if travelmode in modes:
+        url += f"/data=!4m2!4m1!{modes[travelmode]}"
+    return url
 
 
 # ── Distance + temps + tracé RÉELS via Directions API (1 appel) ───
