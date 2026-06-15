@@ -438,15 +438,15 @@ def _best_insert(seq, item, lo_frac=0.34, hi_frac=0.66):
 def itinerary_plain_block(itin):
     if not itin or not itin.get("url"):
         return ""
-    lines = ["", "🗺 VOTRE PARCOURS D'UNE JOURNÉE À PIED", "",
+    lines = ["", "🗺 VOTRE PARCOURS D'UNE JOURNÉE", "",
              "    Les lieux les plus populaires de votre destination, classés pour",
-             "    marcher le moins possible. Déjeuner à mi-parcours, dîner en fin de",
+             "    limiter les trajets. Déjeuner à mi-parcours, dîner en fin de",
              "    journée, bar/club pour finir - suivez simplement les numéros.", ""]
     infos = []
     if itin.get("distance_txt"):
         infos.append(itin["distance_txt"])
     if itin.get("duration_txt"):
-        infos.append(f"{itin['duration_txt']} de marche")
+        infos.append(f"{itin['duration_txt']}")
     if infos:
         lines.append("    " + " · ".join(infos))
         lines.append("")
@@ -499,10 +499,10 @@ def itinerary_email_block(itin):
     steps = "".join(rows)
     infos = []
     if itin.get("distance_txt"):
-        infos.append(f"🚶 {itin['distance_txt']}")
+        infos.append(f"📏 {itin['distance_txt']}")
     if itin.get("duration_txt"):
-        infos.append(f"⏱️ {itin['duration_txt']} de marche")
-    info_line = ("&nbsp;&middot;&nbsp;".join(infos)) or "Parcours optimisé à pied"
+        infos.append(f"⏱️ {itin['duration_txt']}")
+    info_line = ("&nbsp;&middot;&nbsp;".join(infos)) or "Parcours optimisé"
     map_img = ""
     if itin.get("has_map"):
         map_img = ('<img src="cid:routemap" alt="Carte du parcours" width="100%" '
@@ -515,8 +515,8 @@ def itinerary_email_block(itin):
     return f"""
   <tr><td style="padding:26px 36px 8px;">
     <p style="margin:0 0 2px;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:{RED};">Itinéraire</p>
-    <h2 style="margin:0 0 6px;font-size:19px;font-weight:700;color:{NAVY};">Parcours d'une journée à pied</h2>
-    <p style="margin:0 0 10px;font-size:13.5px;color:{TEXT};line-height:1.55;">Ce parcours réunit les lieux <strong>les plus populaires</strong> de votre destination, classés dans l'ordre qui <strong>réduit au maximum la marche</strong>. Le déjeuner tombe à mi-parcours, le dîner en fin de journée, puis un bar ou club pour terminer la soirée&nbsp;: chaque étape a son bouton Maps (avec sa note et son nombre d'avis), ou ouvrez tout le parcours d'un coup en bas.</p>
+    <h2 style="margin:0 0 6px;font-size:19px;font-weight:700;color:{NAVY};">Parcours d'une journée</h2>
+    <p style="margin:0 0 10px;font-size:13.5px;color:{TEXT};line-height:1.55;">Ce parcours réunit les lieux <strong>les plus populaires</strong> de votre destination, classés dans l'ordre qui <strong>réduit au maximum les trajets</strong>. Le déjeuner tombe à mi-parcours, le dîner en fin de journée, puis un bar ou club pour terminer la soirée&nbsp;: chaque étape a son bouton Maps (avec sa note et son nombre d'avis), ou ouvrez tout le parcours d'un coup en bas.</p>
     <p style="margin:0 0 14px;font-size:13.5px;color:{TEXT};">{info_line}</p>
     {map_img}
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f3f6fa;border:1px solid #dde5ee;border-radius:10px;margin-bottom:14px;">
