@@ -261,7 +261,7 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS, tra
     for v in seq:
         v["_step"] = "🎯"
 
-    # Les 2 restaurants LES PLUS POPULAIRES (par avis) — aucun critère de distance.
+    # Les 2 restaurants LES PLUS POPULAIRES (par avis) parmi les atteignables.
     top_restos = _top(restos, 2)
     if len(top_restos) >= 1:
         # Déjeuner : inséré à mi-parcours, mais à la position de la fenêtre
