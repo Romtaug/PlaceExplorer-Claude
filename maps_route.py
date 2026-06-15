@@ -362,6 +362,31 @@ def describe(seq):
 
 
 # ── Bloc texte pour la version body_plain de l'email ──────────────
+def place_url(s):
+    """Lien Google Maps vers UN lieu précis (sa fiche), pour le bouton d'étape."""
+    pid = s.get("PlaceID")
+    if pid:
+        return f"https://www.google.com/maps/place/?q=place_id:{pid}"
+    c = _coords(s)
+    if c:
+        return f"https://www.google.com/maps/search/?api=1&query={c[0]},{c[1]}"
+    return ("https://www.google.com/maps/search/?api=1&query="
+            + urllib.parse.quote(str(s.get("Name", ""))))
+
+
+def _meta(s):
+    """'★ 4.6 · 12 345 avis' à partir des champs de l'Excel (gère les manquants)."""
+    bits = []
+    try:
+        bits.append(f"\u2605 {float(s.get('Rating (on 5)')):.1f}")
+    except (TypeError, ValueError):
+        pass
+    n = int(s.get("Total Reviews") or 0)
+    if n:
+        bits.append(f"{n:,}".replace(",", "\u202f") + " avis")
+    return " \u00b7 ".join(bits)
+
+
 def itinerary_plain_block(itin):
     if not itin or not itin.get("url"):
         return ""
@@ -379,7 +404,11 @@ def itinerary_plain_block(itin):
         lines.append("")
     for i, s in enumerate(itin["sequence"], 1):
         lines.append(f"    {i}. {s.get('_step','')} — {s.get('Name','')}")
-    lines += ["", f"    Ouvrir l'itinéraire dans Google Maps : {itin['url']}", ""]
+        meta = _meta(s)
+        if meta:
+            lines.append(f"       {meta}")
+        lines.append(f"       {place_url(s)}")
+    lines += ["", f"    Ouvrir tout l'itinéraire dans Google Maps : {itin['url']}", ""]
     return "\n".join(lines)
 
 
@@ -387,12 +416,26 @@ def itinerary_plain_block(itin):
 def itinerary_email_block(itin):
     if not itin or not itin.get("url"):
         return ""
-    NAVY, RED, TEXT = "#1f3b63", "#d32f2f", "#3c4043"
-    steps = "".join(
-        f'<tr><td style="padding:6px 0;font-size:13.5px;color:{TEXT};">'
-        f'<strong>{i}.</strong> {s.get("_step","")} — {s.get("Name","")}</td></tr>'
-        for i, s in enumerate(itin["sequence"], 1)
-    )
+    NAVY, RED, TEXT, MUTED = "#1f3b63", "#d32f2f", "#3c4043", "#7a8699"
+    rows = []
+    for i, s in enumerate(itin["sequence"], 1):
+        meta = _meta(s)
+        meta_html = (f'<br><span style="font-size:12px;color:{MUTED};">{meta}</span>'
+                     if meta else "")
+        rows.append(
+            f'<tr><td style="padding:9px 0;border-bottom:1px solid #e6edf5;">'
+            f'<table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr>'
+            f'<td style="font-size:13.5px;color:{TEXT};vertical-align:middle;line-height:1.5;">'
+            f'<strong>{i}.</strong> {s.get("_step","")} — <strong>{s.get("Name","")}</strong>'
+            f'{meta_html}</td>'
+            f'<td align="right" style="vertical-align:middle;white-space:nowrap;padding-left:10px;">'
+            f'<a href="{place_url(s)}" target="_blank" '
+            f'style="display:inline-block;background:#eef2f8;color:{NAVY};padding:7px 13px;'
+            f'border-radius:6px;text-decoration:none;font-weight:600;font-size:12px;'
+            f'border:1px solid #d7e0ec;">\U0001f4cd Maps</a></td>'
+            f'</tr></table></td></tr>'
+        )
+    steps = "".join(rows)
     infos = []
     if itin.get("distance_txt"):
         infos.append(f"🚶 {itin['distance_txt']}")
@@ -407,12 +450,12 @@ def itinerary_email_block(itin):
     btn = (f'<a href="{itin["url"]}" target="_blank" '
            f'style="display:inline-block;background-color:{NAVY};color:#fff;padding:12px 24px;'
            f'border-radius:6px;text-decoration:none;font-weight:600;font-size:14px;">'
-           f'Ouvrir l\'itinéraire dans Google Maps</a>')
+           f'Ouvrir tout l\'itinéraire dans Google Maps</a>')
     return f"""
   <tr><td style="padding:26px 36px 8px;">
     <p style="margin:0 0 2px;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:{RED};">Itinéraire</p>
     <h2 style="margin:0 0 6px;font-size:19px;font-weight:700;color:{NAVY};">Parcours d'une journée à pied</h2>
-    <p style="margin:0 0 10px;font-size:13.5px;color:{TEXT};line-height:1.55;">Ce parcours réunit les lieux <strong>les plus populaires</strong> de votre destination, classés dans l'ordre qui <strong>réduit au maximum la marche</strong>. Le déjeuner tombe à mi-parcours, le dîner en fin de journée, puis un bar ou club pour terminer la soirée&nbsp;: il suffit de suivre les numéros sur la carte.</p>
+    <p style="margin:0 0 10px;font-size:13.5px;color:{TEXT};line-height:1.55;">Ce parcours réunit les lieux <strong>les plus populaires</strong> de votre destination, classés dans l'ordre qui <strong>réduit au maximum la marche</strong>. Le déjeuner tombe à mi-parcours, le dîner en fin de journée, puis un bar ou club pour terminer la soirée&nbsp;: chaque étape a son bouton Maps (avec sa note et son nombre d'avis), ou ouvrez tout le parcours d'un coup en bas.</p>
     <p style="margin:0 0 14px;font-size:13.5px;color:{TEXT};">{info_line}</p>
     {map_img}
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f3f6fa;border:1px solid #dde5ee;border-radius:10px;margin-bottom:14px;">
