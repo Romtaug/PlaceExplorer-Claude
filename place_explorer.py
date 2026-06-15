@@ -340,9 +340,12 @@ def create_excel_file(api_key, location, vacation_month):
         print(f"Fetching data for category: {category}")
         data = search_places(api_key, location, category)
         if data:
+            label = description.split(' ', 1)[1] if ' ' in description else description
+            for p in data:
+                p['_category'] = label
             places_by_category[category] = data
             df = pd.DataFrame(data).sort_values(by='Total Reviews', ascending=False)
-            df = df.drop(columns=['PlaceID', 'Lat', 'Lng'], errors='ignore')  # Excel inchangé
+            df = df.drop(columns=['PlaceID', 'Lat', 'Lng', '_category'], errors='ignore')  # Excel inchangé
             sheet_name = description if len(description) <= 31 else description[:31]
             df.to_excel(writer, sheet_name=sheet_name, index=False)
     writer.close()
