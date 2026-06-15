@@ -259,20 +259,21 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS, tra
     start = max(range(len(visits)), key=lambda i: visits[i].get("Total Reviews", 0) or 0)
     seq = list(optimize_walking_order(visits, start))
     for v in seq:
-        v["_step"] = "🎯 Visite"
+        v["_step"] = "🎯"
 
     # Les 2 restaurants LES PLUS POPULAIRES (par avis) — aucun critère de distance.
     top_restos = _top(restos, 2)
     if len(top_restos) >= 1:
-        mid = len(seq) // 2                       # déjeuner après ~la moitié des visites
-        seq.insert(mid, dict(top_restos[0], _step="🍴 Déjeuner"))
+        # Déjeuner : inséré à mi-parcours, mais à la position de la fenêtre
+        # centrale qui rallonge le MOINS le trajet (pas juste l'index du milieu).
+        seq = _best_insert(seq, dict(top_restos[0], _step="🍴"))
     if len(top_restos) >= 2:
-        seq.append(dict(top_restos[1], _step="🍽️ Dîner"))
+        seq.append(dict(top_restos[1], _step="🍽️"))
 
     # Le bar / club LE PLUS POPULAIRE (bars + clubs confondus).
     top_bar = _top(bars, 1)
     if top_bar:
-        seq.append(dict(top_bar[0], _step="🍹 Bar / Club"))
+        seq.append(dict(top_bar[0], _step="🍹"))
 
     url = build_route_url(seq, travelmode=travelmode)
     dist, dur, poly = walking_distance_time(seq, api_key)
@@ -357,7 +358,7 @@ def _fmt_dur(s):
 
 
 def describe(seq):
-    return "\n".join(f"{i}. {s.get('_step','•')} — {s.get('Name','?')}"
+    return "\n".join(f"{i}. {s.get('_step','•')} - {s.get('Name','?')}"
                      for i, s in enumerate(seq, 1))
 
 
@@ -375,7 +376,7 @@ def place_url(s):
 
 
 def _meta(s):
-    """'★ 4.6 · 12 345 avis' à partir des champs de l'Excel (gère les manquants)."""
+    """'★ 4.6 · 12 345 avis · ++' à partir des champs de l'Excel (gère les manquants)."""
     bits = []
     try:
         bits.append(f"\u2605 {float(s.get('Rating (on 5)')):.1f}")
@@ -384,7 +385,42 @@ def _meta(s):
     n = int(s.get("Total Reviews") or 0)
     if n:
         bits.append(f"{n:,}".replace(",", "\u202f") + " avis")
+    pl = s.get("Price Level")
+    if pl and str(pl) not in ("Not specified", "None", ""):
+        bits.append(str(pl))
     return " \u00b7 ".join(bits)
+
+
+def _addr(s):
+    """Adresse lisible du lieu (vide si non renseignée)."""
+    a = s.get("Address")
+    if a and str(a) not in ("Not specified", "None", ""):
+        return str(a)
+    return str(s.get("City") or "")
+
+
+def _best_insert(seq, item, lo_frac=0.34, hi_frac=0.66):
+    """Insère `item` dans `seq` à la position — bornée à la fenêtre centrale
+    [lo_frac, hi_frac] pour rester un déjeuner « de midi » — qui rallonge le
+    moins le trajet. Fallback : milieu brut si coordonnées indisponibles."""
+    n = len(seq)
+    c = _coords(item)
+    if not c or n < 2:
+        seq.insert(n // 2, item)
+        return seq
+    lo = max(1, int(n * lo_frac))
+    hi = min(n, max(lo, int(n * hi_frac)))
+    best_pos, best_cost = n // 2, None
+    for pos in range(lo, hi + 1):
+        a = _coords(seq[pos - 1])
+        b = _coords(seq[pos]) if pos < n else None
+        if not a:
+            continue
+        cost = hav(*a, *c) + (hav(*c, *b) - hav(*a, *b) if b else 0.0)
+        if best_cost is None or cost < best_cost:
+            best_cost, best_pos = cost, pos
+    seq.insert(best_pos, item)
+    return seq
 
 
 def itinerary_plain_block(itin):
@@ -393,7 +429,7 @@ def itinerary_plain_block(itin):
     lines = ["", "🗺 VOTRE PARCOURS D'UNE JOURNÉE À PIED", "",
              "    Les lieux les plus populaires de votre destination, classés pour",
              "    marcher le moins possible. Déjeuner à mi-parcours, dîner en fin de",
-             "    journée, bar/club pour finir — suivez simplement les numéros.", ""]
+             "    journée, bar/club pour finir - suivez simplement les numéros.", ""]
     infos = []
     if itin.get("distance_txt"):
         infos.append(itin["distance_txt"])
@@ -403,10 +439,13 @@ def itinerary_plain_block(itin):
         lines.append("    " + " · ".join(infos))
         lines.append("")
     for i, s in enumerate(itin["sequence"], 1):
-        lines.append(f"    {i}. {s.get('_step','')} — {s.get('Name','')}")
+        lines.append(f"    {i}. {s.get('_step','')} - {s.get('Name','')}")
         meta = _meta(s)
         if meta:
             lines.append(f"       {meta}")
+        addr = _addr(s)
+        if addr:
+            lines.append(f"       {addr}")
         lines.append(f"       {place_url(s)}")
     lines += ["", f"    Ouvrir tout l'itinéraire dans Google Maps : {itin['url']}", ""]
     return "\n".join(lines)
@@ -420,19 +459,24 @@ def itinerary_email_block(itin):
     rows = []
     for i, s in enumerate(itin["sequence"], 1):
         meta = _meta(s)
-        meta_html = (f'<br><span style="font-size:12px;color:{MUTED};">{meta}</span>'
-                     if meta else "")
+        addr = _addr(s)
+        sub = []
+        if meta:
+            sub.append(f'<span style="font-size:12px;color:{MUTED};">{meta}</span>')
+        if addr:
+            sub.append(f'<span style="font-size:11.5px;color:{MUTED};">\U0001f4cd {addr}</span>')
+        sub_html = ("<br>" + "<br>".join(sub)) if sub else ""
         rows.append(
             f'<tr><td style="padding:9px 0;border-bottom:1px solid #e6edf5;">'
             f'<table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr>'
-            f'<td style="font-size:13.5px;color:{TEXT};vertical-align:middle;line-height:1.5;">'
-            f'<strong>{i}.</strong> {s.get("_step","")} — <strong>{s.get("Name","")}</strong>'
-            f'{meta_html}</td>'
+            f'<td style="font-size:13.5px;color:{TEXT};vertical-align:middle;line-height:1.55;">'
+            f'<strong>{i}.</strong> {s.get("_step","")} - <strong>{s.get("Name","")}</strong>'
+            f'{sub_html}</td>'
             f'<td align="right" style="vertical-align:middle;white-space:nowrap;padding-left:10px;">'
             f'<a href="{place_url(s)}" target="_blank" '
             f'style="display:inline-block;background:#eef2f8;color:{NAVY};padding:7px 13px;'
             f'border-radius:6px;text-decoration:none;font-weight:600;font-size:12px;'
-            f'border:1px solid #d7e0ec;">\U0001f4cd Maps</a></td>'
+            f'border:1px solid #d7e0ec;">Maps</a></td>'
             f'</tr></table></td></tr>'
         )
     steps = "".join(rows)
