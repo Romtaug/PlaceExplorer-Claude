@@ -1,375 +1,707 @@
 # -*- coding: utf-8 -*-
 """
-Itinéraire d'UNE JOURNÉE à pied pour PlaceExplorer — un seul lien Google Maps.
+PlaceExplorer - version GitHub Actions
+- Lit la localisation et le mois depuis les variables d'environnement (inputs du workflow)
+- Génère l'Excel multi-feuilles (31 catégories, top 20 lieux triés par nombre d'avis)
+- Envoie un email HTML stylé depuis romtaug@gmail.com avec l'Excel (+ images si présentes) en pièce jointe
 
-Logique :
-  - top des lieux les plus populaires (nb d'avis), HORS restaurants/bars/clubs
-    et hors catégories non-touristiques (aéroports, gares, hôpitaux, écoles,
-    supermarchés, salles de sport) ;
-  - ordre optimisé pour minimiser la marche (nearest-neighbor + 2-opt, comme
-    thermodata_engine) ;
-  - déjeuner = resto le plus populaire (mi-parcours), dîner = 2e resto le plus
-    populaire (fin), bar/club = le plus populaire (après) ;
-  - 1 seul lien Maps (format api=1, travelmode=walking) ;
-  - distance + temps de marche RÉELS via la Directions API (1 seul appel).
-
-Nécessite 'Lat'/'Lng'/'PlaceID' sur chaque lieu (cf. intégration).
+Secrets requis (GitHub > Settings > Secrets and variables > Actions) :
+- GOOGLE_API_KEY      : clé API Google Places
+- GMAIL_APP_PASSWORD  : mot de passe d'application Gmail de romtaug@gmail.com
 """
 
-import math
-import urllib.parse
+import os
+import re
+import sys
+import time
+import shutil
+import smtplib
+import unicodedata
+
 import requests
+import pandas as pd
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
+from email import encoders
+from openpyxl import load_workbook
 
-# Nombre de visites par défaut, réparties moitié matin / moitié après-midi
-# autour du déjeuner. Pas de plafond imposé : monte ce chiffre si tu veux.
-N_VISITS = 10
+from maps_route import (build_day_itinerary, itinerary_email_block,
+                        itinerary_plain_block, describe, download_static_map)
 
-FOOD_CATEGORIES = {"restaurants"}
-BAR_CATEGORIES = {"bars", "nightclubs"}            # bar OU club, le plus populaire
-NON_TOURIST = {"airports", "train_stations", "hospitals",
-               "schools", "supermarkets", "gym"}
+# ----------------------------------------------------------------------------
+# Configuration (depuis l'environnement - injecté par le workflow)
+# ----------------------------------------------------------------------------
+API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+SENDER_EMAIL = "romtaug@gmail.com"
+RECEIVER_EMAILS = [e.strip() for e in os.environ.get("RECEIVER_EMAILS", "romtaug@gmail.com").split(",") if e.strip()]
 
+LOCATION = os.environ.get("LOCATION", "").strip()
+VACATION_MONTH = os.environ.get("VACATION_MONTH", "").strip()
 
-# ── Géométrie (reprise de thermodata_engine) ──────────────────────
-def _coords(s):
-    lat, lng = s.get("Lat"), s.get("Lng")
-    if lat is None or lng is None:
-        return None
-    return (float(lat), float(lng))
-
-
-def hav(la1, lo1, la2, lo2):
-    R = 6371000.0
-    p1, p2 = math.radians(la1), math.radians(la2)
-    dp, dl = math.radians(la2 - la1), math.radians(lo2 - lo1)
-    x = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(x))
-
-
-def _route_len(stops):
-    tot = 0.0
-    for i in range(len(stops) - 1):
-        a, b = _coords(stops[i]), _coords(stops[i + 1])
-        if a and b:
-            tot += hav(a[0], a[1], b[0], b[1])
-    return tot
+if not API_KEY:
+    print("❌ GOOGLE_API_KEY manquant (secret GitHub).")
+    sys.exit(1)
+if not GMAIL_APP_PASSWORD:
+    print("❌ GMAIL_APP_PASSWORD manquant (secret GitHub).")
+    sys.exit(1)
+if not LOCATION or not VACATION_MONTH:
+    print("❌ LOCATION ou VACATION_MONTH manquant (inputs du workflow).")
+    sys.exit(1)
 
 
-# ── Optimisation d'ordre : nearest-neighbor + 2-opt ───────────────
-def _nearest_neighbor(stops, start):
-    rest = set(range(len(stops)))
-    order = [start]
-    rest.discard(start)
-    while rest:
-        la, lo = _coords(stops[order[-1]])
-        nxt = min(rest, key=lambda j: hav(la, lo, *_coords(stops[j])))
-        order.append(nxt)
-        rest.discard(nxt)
-    return [stops[i] for i in order]
+def is_valid_email(email):
+    return re.match(r"[^@]+@[^@]+\.[^@]+", email)
 
 
-def _two_opt(route):
-    best, improved = route[:], True
-    while improved:
-        improved = False
-        for i in range(1, len(best) - 1):
-            for k in range(i + 1, len(best)):
-                if k - i == 1:
-                    continue
-                cand = best[:i] + best[i:k + 1][::-1] + best[k + 1:]
-                if _route_len(cand) < _route_len(best) - 1e-6:
-                    best, improved = cand, True
-    return best
+for email in RECEIVER_EMAILS:
+    if not is_valid_email(email):
+        print(f"❌ Adresse email invalide : {email}")
+        sys.exit(1)
+print("✅ Toutes les adresses email sont valides.")
 
 
-def optimize_walking_order(stops, start=0):
-    stops = [s for s in stops if _coords(s)]
-    if len(stops) <= 2:
-        return stops
-    return _two_opt(_nearest_neighbor(stops, start))
+# ----------------------------------------------------------------------------
+# Normalisation
+# ----------------------------------------------------------------------------
+def normalize_location(location):
+    """Force le format 'Ville, Pays' ou 'Pays'. Échoue proprement en CI si invalide."""
+    location = " ".join(location.strip().split())
+    if "," in location:
+        parts = location.split(",")
+        if len(parts) == 2:
+            city, country = parts[0].strip(), parts[1].strip()
+            if city and country:
+                return f"{city.title()}, {country.title()}"
+    elif location.replace(" ", "").isalpha():
+        return location.title()
+    print("❌ Format incorrect. Utilisez 'Ville, Pays' ou 'Pays' (ex : Paris, France).")
+    sys.exit(1)
 
 
-# ── Sélection ─────────────────────────────────────────────────────
-def _top(places, k=None):
-    r = sorted(places, key=lambda d: d.get("Total Reviews", 0) or 0, reverse=True)
-    return r[:k] if k else r
-
-
-# ── Lien Google Maps (api=1, marche, place_id fiables) ────────────
-def _loc(s):
-    return s.get("Address") or s.get("Name") or ""
-
-
-def build_route_url(stops, travelmode="walking"):
-    stops = [s for s in stops if _loc(s)]
-    if len(stops) < 2:
-        return None
-    o, d, mid = stops[0], stops[-1], stops[1:-1]
-    p = {"api": "1", "origin": _loc(o), "destination": _loc(d), "travelmode": travelmode}
-    if o.get("PlaceID"):
-        p["origin_place_id"] = o["PlaceID"]
-    if d.get("PlaceID"):
-        p["destination_place_id"] = d["PlaceID"]
-    if mid:
-        p["waypoints"] = "|".join(_loc(s) for s in mid)
-        if all(s.get("PlaceID") for s in mid):
-            p["waypoint_place_ids"] = "|".join(s["PlaceID"] for s in mid)
-    return "https://www.google.com/maps/dir/?" + urllib.parse.urlencode(p, quote_via=urllib.parse.quote_plus)
-
-
-# ── Distance + temps + tracé RÉELS via Directions API (1 appel) ───
-def walking_distance_time(stops, api_key):
-    """Retourne (distance_m, duree_s, polyline_encodee) réels à pied,
-    ou (None, None, None) si échec."""
-    stops = [s for s in stops if _coords(s)]
-    if len(stops) < 2 or not api_key:
-        return None, None, None
-
-    def ref(s):
-        return f"place_id:{s['PlaceID']}" if s.get("PlaceID") else f"{s['Lat']},{s['Lng']}"
-
-    params = {
-        "origin": ref(stops[0]),
-        "destination": ref(stops[-1]),
-        "mode": "walking",
-        "key": api_key,
-    }
-    if len(stops) > 2:
-        params["waypoints"] = "|".join(ref(s) for s in stops[1:-1])
-    try:
-        r = requests.get("https://maps.googleapis.com/maps/api/directions/json",
-                         params=params, timeout=30)
-        data = r.json()
-        if data.get("status") != "OK" or not data.get("routes"):
-            print(f"⚠️ Directions API : {data.get('status')} {data.get('error_message','')}")
-            return None, None, None
-        route = data["routes"][0]
-        legs = route["legs"]
-        dist = sum(l["distance"]["value"] for l in legs)
-        dur = sum(l["duration"]["value"] for l in legs)
-        poly = (route.get("overview_polyline") or {}).get("points")
-        return dist, dur, poly
-    except Exception as e:
-        print(f"⚠️ Directions API erreur : {e}")
-        return None, None, None
-
-
-# ── Itinéraire d'une journée ──────────────────────────────────────
-def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS, travelmode="walking"):
-    """
-    Retourne un dict :
-      { 'url', 'sequence', 'distance_m', 'duration_s', 'distance_txt', 'duration_txt' }
-    ou None si pas assez de données.
-    """
-    visits, restos, bars = [], [], []
-    for cat, places in places_by_category.items():
-        for p in places:
-            if not _coords(p):
-                continue
-            if cat in FOOD_CATEGORIES:
-                restos.append(p)
-            elif cat in BAR_CATEGORIES:
-                bars.append(p)
-            elif cat in NON_TOURIST:
-                continue
-            else:
-                visits.append(p)
-
-    visits = _top(visits, n_visits)
-    if len(visits) < 2:
-        return None
-
-    start = max(range(len(visits)), key=lambda i: visits[i].get("Total Reviews", 0) or 0)
-    seq = list(optimize_walking_order(visits, start))
-    for v in seq:
-        v["_step"] = "🎯 Visite"
-
-    # Les 2 restaurants LES PLUS POPULAIRES (par avis) — aucun critère de distance.
-    top_restos = _top(restos, 2)
-    if len(top_restos) >= 1:
-        mid = len(seq) // 2                       # déjeuner après ~la moitié des visites
-        seq.insert(mid, dict(top_restos[0], _step="🍴 Déjeuner"))
-    if len(top_restos) >= 2:
-        seq.append(dict(top_restos[1], _step="🍽️ Dîner"))
-
-    # Le bar / club LE PLUS POPULAIRE (bars + clubs confondus).
-    top_bar = _top(bars, 1)
-    if top_bar:
-        seq.append(dict(top_bar[0], _step="🍹 Bar / Club"))
-
-    url = build_route_url(seq, travelmode=travelmode)
-    dist, dur, poly = walking_distance_time(seq, api_key)
-
-    return {
-        "url": url,
-        "sequence": seq,
-        "polyline": poly,
-        "distance_m": dist,
-        "duration_s": dur,
-        "distance_txt": _fmt_dist(dist),
-        "duration_txt": _fmt_dur(dur),
-        "has_map": False,   # passe à True quand la carte statique est téléchargée
-    }
-
-
-# ── Carte statique (image PNG du parcours) via Static Maps API ────
-def static_map_url(itin, api_key, size="640x400", scale=2):
-    """Construit l'URL Static Maps : tracé du parcours + marqueurs par type.
-    Utilise la polyline réelle (chemin piéton) si dispo, sinon relie les points."""
-    seq = itin.get("sequence") or []
-    pts = [s for s in seq if _coords(s)]
-    if len(pts) < 2 or not api_key:
-        return None
-
-    NAVY, ORANGE, PURPLE = "0x1f3b63", "0xe67e22", "0x8e44ad"  # visites / repas / bar
-
-    # Tracé : polyline réelle si on l'a, sinon segments droits entre les points
-    if itin.get("polyline"):
-        path = f"weight:4|color:{NAVY}cc|enc:{itin['polyline']}"
-    else:
-        coords = "|".join(f"{s['Lat']},{s['Lng']}" for s in pts)
-        path = f"weight:4|color:{NAVY}cc|{coords}"
-
-    # Un marqueur numéroté par arrêt (1-9 puis A-Z), coloré par type.
-    # Label Static Maps = 1 seul caractère, d'où le passage aux lettres après 9.
-    def _label(i):
-        return str(i) if i <= 9 else chr(ord("A") + i - 10)
-
-    params = [("size", size), ("scale", str(scale)), ("path", path), ("key", api_key)]
-    for i, s in enumerate(pts, 1):
-        step = s.get("_step", "")
-        color = ORANGE if ("Déjeuner" in step or "Dîner" in step) else \
-                PURPLE if "Bar" in step else NAVY
-        params.append(("markers",
-                       f"size:mid|color:{color}|label:{_label(i)}|{s['Lat']},{s['Lng']}"))
-
-    return "https://maps.googleapis.com/maps/api/staticmap?" + \
-        urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-
-
-def download_static_map(itin, api_key, dest_path, size="640x400", scale=2):
-    """Télécharge l'image de la carte et l'écrit dans dest_path. True si OK."""
-    url = static_map_url(itin, api_key, size=size, scale=scale)
-    if not url:
-        return False
-    try:
-        r = requests.get(url, timeout=30)
-        ctype = r.headers.get("Content-Type", "")
-        if r.status_code == 200 and ctype.startswith("image/"):
-            with open(dest_path, "wb") as f:
-                f.write(r.content)
-            return True
-        print(f"⚠️ Static Maps : {r.status_code} {ctype} {r.text[:120]}")
-        return False
-    except Exception as e:
-        print(f"⚠️ Static Maps erreur : {e}")
-        return False
-
-
-def _fmt_dist(m):
-    if not m:
-        return None
-    return f"{m/1000:.1f} km".replace(".", ",")
-
-
-def _fmt_dur(s):
-    if not s:
-        return None
-    mins = round(s / 60)
-    return f"{mins//60}h{mins%60:02d}" if mins >= 60 else f"{mins} min"
-
-
-def describe(seq):
-    return "\n".join(f"{i}. {s.get('_step','•')} — {s.get('Name','?')}"
-                     for i, s in enumerate(seq, 1))
-
-
-# ── Bloc texte pour la version body_plain de l'email ──────────────
-def itinerary_plain_block(itin):
-    if not itin or not itin.get("url"):
-        return ""
-    lines = ["", "🗺 VOTRE PARCOURS D'UNE JOURNÉE À PIED", ""]
-    infos = []
-    if itin.get("distance_txt"):
-        infos.append(itin["distance_txt"])
-    if itin.get("duration_txt"):
-        infos.append(f"{itin['duration_txt']} de marche")
-    if infos:
-        lines.append("    " + " · ".join(infos))
-        lines.append("")
-    for i, s in enumerate(itin["sequence"], 1):
-        lines.append(f"    {i}. {s.get('_step','')} — {s.get('Name','')}")
-    lines += ["", f"    Ouvrir l'itinéraire dans Google Maps : {itin['url']}", ""]
-    return "\n".join(lines)
-
-
-# ── Bloc HTML autonome pour l'email (styles inline, à insérer tel quel) ──
-def itinerary_email_block(itin):
-    if not itin or not itin.get("url"):
-        return ""
-    NAVY, RED, TEXT = "#1f3b63", "#d32f2f", "#3c4043"
-    steps = "".join(
-        f'<tr><td style="padding:6px 0;font-size:13.5px;color:{TEXT};">'
-        f'<strong>{i}.</strong> {s.get("_step","")} — {s.get("Name","")}</td></tr>'
-        for i, s in enumerate(itin["sequence"], 1)
+def normalize_filename(filename):
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', filename)
+        if unicodedata.category(c) != 'Mn'
     )
-    infos = []
-    if itin.get("distance_txt"):
-        infos.append(f"🚶 {itin['distance_txt']}")
-    if itin.get("duration_txt"):
-        infos.append(f"⏱️ {itin['duration_txt']} de marche")
-    info_line = ("&nbsp;&middot;&nbsp;".join(infos)) or "Parcours optimisé à pied"
-    map_img = ""
-    if itin.get("has_map"):
-        map_img = ('<img src="cid:routemap" alt="Carte du parcours" width="100%" '
-                   'style="display:block;width:100%;max-width:100%;height:auto;'
-                   'border-radius:10px;border:1px solid #dde5ee;margin-bottom:14px;">')
-    btn = (f'<a href="{itin["url"]}" target="_blank" '
-           f'style="display:inline-block;background-color:{NAVY};color:#fff;padding:12px 24px;'
-           f'border-radius:6px;text-decoration:none;font-weight:600;font-size:14px;">'
-           f'Ouvrir l\'itinéraire dans Google Maps</a>')
-    return f"""
-  <tr><td style="padding:26px 36px 8px;">
-    <p style="margin:0 0 2px;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:{RED};">Itinéraire</p>
-    <h2 style="margin:0 0 6px;font-size:19px;font-weight:700;color:{NAVY};">Parcours d'une journée à pied</h2>
-    <p style="margin:0 0 14px;font-size:13.5px;color:{TEXT};">{info_line}</p>
-    {map_img}
-    <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f3f6fa;border:1px solid #dde5ee;border-radius:10px;margin-bottom:14px;">
-      <tr><td style="padding:14px 18px;"><table role="presentation" width="100%">{steps}</table></td></tr>
-    </table>
-    <div style="text-align:center;">{btn}</div>
-  </td></tr>"""
 
 
-if __name__ == "__main__":
-    demo = {
-        "historical_sites": [
-            {"Name": "Tour Eiffel", "Address": "Champ de Mars, 75007 Paris", "PlaceID": "A",
-             "Lat": 48.8584, "Lng": 2.2945, "Total Reviews": 350000},
-            {"Name": "Arc de Triomphe", "Address": "Pl. Charles de Gaulle, 75008 Paris", "PlaceID": "B",
-             "Lat": 48.8738, "Lng": 2.2950, "Total Reviews": 210000}],
-        "museums": [
-            {"Name": "Louvre", "Address": "Rue de Rivoli, 75001 Paris", "PlaceID": "C",
-             "Lat": 48.8606, "Lng": 2.3376, "Total Reviews": 300000},
-            {"Name": "Orsay", "Address": "75007 Paris", "PlaceID": "D",
-             "Lat": 48.8600, "Lng": 2.3266, "Total Reviews": 150000}],
-        "parks": [{"Name": "Luxembourg", "Address": "75006 Paris", "PlaceID": "E",
-                   "Lat": 48.8462, "Lng": 2.3372, "Total Reviews": 180000}],
-        "restaurants": [
-            {"Name": "Le Comptoir", "Address": "75006 Paris", "PlaceID": "R1",
-             "Lat": 48.8519, "Lng": 2.3387, "Total Reviews": 5000},
-            {"Name": "Bistrot Eiffel", "Address": "75007 Paris", "PlaceID": "R2",
-             "Lat": 48.8570, "Lng": 2.2980, "Total Reviews": 4200}],
-        "nightclubs": [{"Name": "Le Rex Club", "Address": "75002 Paris", "PlaceID": "N1",
-                        "Lat": 48.8703, "Lng": 2.3470, "Total Reviews": 9000}],
-        "bars": [{"Name": "Le Perchoir", "Address": "75011 Paris", "PlaceID": "B1",
-                  "Lat": 48.8670, "Lng": 2.3780, "Total Reviews": 8000}],
-        "airports": [{"Name": "CDG", "Address": "95700 Roissy", "PlaceID": "X",
-                      "Lat": 49.0097, "Lng": 2.5479, "Total Reviews": 400000}],
+def extract_city_from_address(full_address):
+    address_parts = full_address.split(", ")
+    if "Unnamed Road" in full_address:
+        city = address_parts[-2] if len(address_parts) > 2 else address_parts[-1]
+    elif len(address_parts) > 2:
+        city = address_parts[-2]
+    elif len(address_parts) == 2:
+        city = address_parts[0]
+    else:
+        city = full_address.split(" ")[0]
+    return city
+
+
+# ----------------------------------------------------------------------------
+# Google Places
+# ----------------------------------------------------------------------------
+def get_place_details(place_id, api_key):
+    details_url = "https://maps.googleapis.com/maps/api/place/details/json"
+    details_params = {
+        'place_id': place_id,
+        'fields': 'name,formatted_address,rating,user_ratings_total,price_level,international_phone_number,website,geometry/location',
+        'language': 'en',
+        'key': api_key
     }
-    itin = build_day_itinerary(demo, api_key=None)   # api_key=None -> pas de temps réel en démo
-    print(describe(itin["sequence"]))
-    print()
-    print("Distance/temps réels :", itin["distance_txt"], itin["duration_txt"], "(None car pas d'appel API en démo)")
-    print()
-    print(itin["url"])
+    response = requests.get(details_url, params=details_params, timeout=30)
+    if response.status_code == 200:
+        return response.json().get('result', {})
+    print(f"Failed to fetch details for place_id: {place_id}")
+    return None
+
+
+def search_places(api_key, location, category):
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {'query': f'{category} in {location}', 'language': 'en', 'key': api_key}
+
+    response = requests.get(url, params=params, timeout=30)
+    if response.status_code != 200:
+        print(f"Erreur {response.status_code} lors de la récupération des données pour {category}")
+        return []
+    payload = response.json()
+    api_status = payload.get('status', 'UNKNOWN')
+    if api_status not in ('OK', 'ZERO_RESULTS'):
+        print(f"⚠️ API status '{api_status}' pour {category} : {payload.get('error_message', 'pas de détail')}")
+        return []
+    places = payload.get('results', [])[:20]  # top 20 de la 1ère page
+
+    detailed_places = []
+    for place in places:
+        place_id = place.get('place_id')
+        if not place_id:
+            continue
+        details = get_place_details(place_id, api_key)
+        if details:
+            full_address = details.get('formatted_address', 'Not specified')
+            detailed_places.append({
+                'City': extract_city_from_address(full_address),
+                'Address': full_address,
+                'Name': details.get('name', 'Not specified'),
+                'Total Reviews': details.get('user_ratings_total', 0),
+                'Rating (on 5)': details.get('rating', 'Not rated'),
+                'Price Level': {0: "Free", 1: "+", 2: "++", 3: "+++", 4: "++++"}.get(
+                    details.get('price_level', None), 'Not specified'),
+                'Maps': f'=HYPERLINK("https://www.google.com/maps/place/?q=place_id:{place_id}", "📍 Google Maps")',
+                'Phone': details.get('international_phone_number', 'Not available'),
+                'PlaceID': place_id,
+                'Lat': (details.get('geometry') or {}).get('location', {}).get('lat'),
+                'Lng': (details.get('geometry') or {}).get('location', {}).get('lng'),
+            })
+        time.sleep(0.05)
+    return detailed_places
+
+
+# ----------------------------------------------------------------------------
+# Excel
+# ----------------------------------------------------------------------------
+def adjust_column_width(file_path):
+    wb = load_workbook(file_path)
+    for sheet in wb.sheetnames:
+        ws = wb[sheet]
+        for col in ws.columns:
+            max_length = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except Exception:
+                    pass
+            ws.column_dimensions[col_letter].width = max_length + 2
+    wb.save(file_path)
+
+
+
+def style_workbook(file_path):
+    """
+    Stylise tout le classeur : en-têtes navy, lignes alternées, filtres,
+    volet figé, liens Maps en bleu, formats de nombres, largeurs ajustées.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    NAVY = "1F3B63"
+    BAND = "F3F6FA"
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color=NAVY, end_color=NAVY, fill_type="solid")
+    band_fill = PatternFill(start_color=BAND, end_color=BAND, fill_type="solid")
+    body_font = Font(name="Calibri", size=10.5, color="3C4043")
+    link_font = Font(name="Calibri", size=10.5, color="1A73E8", underline="single", bold=True)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center", wrap_text=False)
+    thin_border = Border(bottom=Side(style="thin", color="E0E5EA"))
+
+    wb = load_workbook(file_path)
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        if ws.max_row < 1:
+            continue
+
+        headers = [c.value for c in ws[1]]
+        col_idx = {h: i + 1 for i, h in enumerate(headers)}
+
+        # En-tête
+        ws.row_dimensions[1].height = 24
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+
+        # Corps
+        for r, row in enumerate(ws.iter_rows(min_row=2), start=2):
+            for cell in row:
+                cell.font = body_font
+                cell.border = thin_border
+                cell.alignment = left
+                if r % 2 == 0:
+                    cell.fill = band_fill
+            # Colonnes spécifiques
+            if 'Total Reviews' in col_idx:
+                c = ws.cell(row=r, column=col_idx['Total Reviews'])
+                c.number_format = '#,##0'
+                c.alignment = center
+            for name in ('Rating (on 5)', 'Price Level', 'City'):
+                if name in col_idx:
+                    ws.cell(row=r, column=col_idx[name]).alignment = center
+            if 'Maps' in col_idx:
+                c = ws.cell(row=r, column=col_idx['Maps'])
+                c.font = link_font
+                c.alignment = center
+
+        # Volet figé + filtres
+        ws.freeze_panes = "A2"
+        if ws.max_row >= 2:
+            ws.auto_filter.ref = ws.dimensions
+
+        # Largeurs : basées sur le contenu, libellé fixe pour Maps, bornées
+        for i, col in enumerate(ws.columns, start=1):
+            letter = get_column_letter(i)
+            header = headers[i - 1] if i - 1 < len(headers) else ""
+            if header == 'Maps':
+                ws.column_dimensions[letter].width = 18
+                continue
+            max_length = len(str(header or ""))
+            for cell in col:
+                if cell.row == 1 or cell.value is None:
+                    continue
+                max_length = max(max_length, len(str(cell.value)))
+            ws.column_dimensions[letter].width = max(12, min(max_length + 3, 55))
+
+    wb.save(file_path)
+    print(f"✅ Classeur stylisé : {file_path}")
+
+
+def remove_invalid_rows(file_path, location):
+    country = location.split(",")[-1].strip()
+    print(f"Filtrage des lignes se terminant par : {country}")
+    wb = load_workbook(file_path)
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows_to_delete = []
+        for row in ws.iter_rows(min_row=2):
+            cell = row[1]  # colonne Address
+            if cell.value and isinstance(cell.value, str):
+                cell_value_normalized = " ".join(cell.value.split())
+                if not cell_value_normalized.lower().endswith(country.lower()):
+                    rows_to_delete.append(cell.row)
+        for row_idx in sorted(set(rows_to_delete), reverse=True):
+            ws.delete_rows(row_idx)
+    wb.save(file_path)
+    print(f"✅ Lignes se terminant par '{country}' conservées dans : {file_path}")
+
+
+CATEGORIES = {
+    # Découvertes
+    'historical_sites': '🏰 Sites historiques',
+    'museums': '🖼️ Musées',
+    'churches': '⛪ Églises',
+    'cultural_centers': '🎭 Centres culturels',
+    'hiking_trails': '🥾 Sentiers de randonnée',
+    # Restauration
+    'restaurants': '🍴 Restaurants',
+    'bars': '🍹 Bars',
+    # Détente
+    'parks': '🌳 Parcs',
+    'beaches': '🏖️ Plages',
+    'lakes': '🏞️ Lacs',
+    # Divertissements
+    'concert_halls': '🎶 Salles de concert',
+    'nightclubs': '💃 Boîtes de nuit',
+    'movie_theaters': '🎬 Cinémas',
+    'stadiums': '🏟️ Stades',
+    # Shopping
+    'markets': '🌽 Marchés',
+    'boutiques': '🛍️ Boutiques',
+    'supermarkets': '🛒 Supermarchés',
+    # Activités
+    'festivals': '🎉 Festivals',
+    'amusement_parks': "🎢 Parcs d'attractions",
+    'zoos': '🐘 Zoos',
+    'aquariums': '🐠 Aquariums',
+    'mountain_resorts': '🏔️ Stations de montagne',
+    # Sport
+    'bike_rentals': '🚴 Locations de vélos',
+    'campgrounds': '🏕️ Campings',
+    'sports_centers': '🏋️‍♂️ Centres sportifs',
+    'spas': '💆‍♀️ Spas',
+    'gym': '🏋️‍♀️ Salles de sport',
+    # Transports
+    'train_stations': '🚆 Gares',
+    'airports': '✈️ Aéroports',
+    # Éducation
+    'schools': '🏫 Écoles',
+    # Santé
+    'hospitals': '🏥 Hôpitaux',
+}
+
+
+def create_excel_file(api_key, location, vacation_month):
+    normalize_location(location)  # validation
+    location = " ".join(location.split())
+    vacation_month = " ".join(vacation_month.split()).replace(",", "-").replace(" ", "")
+    sanitized_location = location.replace(",", "-").replace(" ", "")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    file_name = f"{sanitized_location}_{vacation_month}.xlsx"
+    file_path = os.path.join(script_dir, file_name)
+
+    writer = pd.ExcelWriter(file_path, engine='openpyxl')
+    places_by_category = {}
+    for category, description in CATEGORIES.items():
+        print(f"Fetching data for category: {category}")
+        data = search_places(api_key, location, category)
+        if data:
+            places_by_category[category] = data
+            df = pd.DataFrame(data).sort_values(by='Total Reviews', ascending=False)
+            df = df.drop(columns=['PlaceID', 'Lat', 'Lng'], errors='ignore')  # Excel inchangé
+            sheet_name = description if len(description) <= 31 else description[:31]
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    writer.close()
+
+    adjust_column_width(file_path)
+    print(f"✅ Excel file created with clickable links: {file_path}")
+    return file_path, location, vacation_month, places_by_category
+
+
+# ----------------------------------------------------------------------------
+# Email HTML (même contenu, même liens - juste stylé)
+# ----------------------------------------------------------------------------
+def build_email_bodies(location, location_cleaned, vacation_month_cleaned, itinerary_block="", itinerary_plain=""):
+    ia_prompt = (
+        f"Je cherche des expériences et activités extraordinaires à {location_cleaned} en {vacation_month_cleaned}, "
+        "fais un top 20 des incontournables durant cette période (événements, activités, monuments, restaurants, quartiers) "
+        "et un top 10 des villes à visiter autour avec le temps de trajet, indique les démarches administratives nécessaires "
+        "(documents, visas, vaccins), les précautions à prendre (arnaques, numéros d'urgence), les coûts approximatifs, "
+        "la météo moyenne, les événements locaux, et des astuces pour se déplacer, respecter les coutumes, et profiter au maximum."
+    )
+
+    import urllib.parse as _up
+    claude_url_plain = "https://claude.ai/new?q=" + _up.quote(ia_prompt)
+
+    # --- Version texte brut (fallback, identique à l'originale) ---
+    body_plain = f"""Bienvenue à bord de Place Explorer !
+
+Découvrez {location} ! C'est une destination rêvée pour des aventures inoubliables. Votre guide inclut :
+    - Les lieux incontournables à visiter
+    - Un plan d'organisation pour votre voyage
+
+{itinerary_plain}🗺 Étapes pour organiser votre voyage :
+    1. Ouvrez le fichier Excel attaché avec Google Sheet en cliquant une fois dessus
+    2. Consultez chaque feuille pour explorer les meilleurs options par catégorie
+    3. Planifiez vos activités (par exemple 2/jours par feuille) sur : https://www.google.com/mymaps un calque par ville
+    4. Si le réseau est payant à l’étranger, utilisez Google Maps hors connexion : https://support.google.com/maps/answer/6291838?hl=fr
+    5. Envoyez-vous votre parcours du jour (en fonction de la proximité) sur WhatsApp ou via Google Docs pour le garder à portée de main sur votre téléphone : https://web.whatsapp.com ou https://docs.google.com
+
+🌍 Liens utiles :
+    - ✈ Pour trouver les vols les moins chers et obtenir des indemnisations en cas de retard : https://www.skyscanner.fr/ ou https://www.airhelp.com/fr/
+    - 🚅 Pour comparer tous les moyens de transport : https://www.rome2rio.com/
+    - 🏠 Pour réserver votre hébergement et véhicule : https://www.airbnb.com et https://www.booking.com
+    - 🖍 Pour des avis et recommandations : https://www.tripadvisor.com
+    - 🗺 Pour réserver des activités locales : https://www.getyourguide.fr/
+    - 📞 Pour trouver des eSIM à moindre coût à l'étranger : https://www.airalo.com/fr
+    - 💳 Pour dépenser sans frais de change à l'étranger, ouvrez un compte Revolut : https://revolut.com/referral/?referral-code=romainavh3!DEC1-24-VR-FR
+
+🤖 Ouvrez ce lien pour lancer le prompt ci-dessous dans Claude (déjà pré-rempli, appuyez juste sur Entrée) : {claude_url_plain}\n\nOu copiez-le manuellement sur https://claude.ai :
+
+"{ia_prompt}"
+
+Nous espérons que vous passerez un moment incroyable. Bon voyage ! ✈
+N'hésitez pas à faire un don via PayPal à l'adresse romtaug@gmail.com si cela vous a aidé.
+Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect.netlify.app/"""
+
+    # --- Version HTML professionnelle (mêmes liens, même contenu) ---
+    NAVY = '#1f3b63'
+    RED = '#d32f2f'
+    TEXT = '#3c4043'
+    MUTED = '#70757a'
+
+    def btn(url, label, bg=NAVY):
+        return (f'<a href="{url}" target="_blank" '
+                f'style="display:inline-block;background-color:{bg};color:#ffffff;'
+                f'padding:11px 22px;border-radius:6px;text-decoration:none;font-weight:600;'
+                f'font-size:13px;letter-spacing:0.2px;">{label}</a>')
+
+    def section_title(label, title):
+        return (f'<p style="margin:0 0 2px;font-size:11px;font-weight:700;letter-spacing:1.5px;'
+                f'text-transform:uppercase;color:{RED};">{label}</p>'
+                f'<h2 style="margin:0 0 16px;font-size:19px;font-weight:700;color:{NAVY};">{title}</h2>')
+
+    def step(num, text, buttons=''):
+        badge = (f'<span style="display:inline-block;width:26px;height:26px;line-height:26px;'
+                 f'border-radius:50%;background-color:{NAVY};color:#ffffff;text-align:center;'
+                 f'font-size:13px;font-weight:700;">{num}</span>')
+        extra = f'<div style="margin-top:8px;">{buttons}</div>' if buttons else ''
+        return (f'<tr><td style="padding:10px 14px 10px 0;vertical-align:top;width:26px;">{badge}</td>'
+                f'<td style="padding:12px 0;font-size:14px;color:{TEXT};line-height:1.6;">{text}{extra}</td></tr>')
+
+    def useful(name, text, buttons):
+        return (f'<tr><td style="padding:14px 0;border-bottom:1px solid #eceff1;">'
+                f'<p style="margin:0 0 2px;font-size:14px;font-weight:700;color:{NAVY};">{name}</p>'
+                f'<p style="margin:0 0 9px;font-size:13px;color:{TEXT};line-height:1.55;">{text}</p>'
+                f'{buttons}</td></tr>')
+
+    def small_btn(url, label):
+        return (f'<a href="{url}" target="_blank" '
+                f'style="display:inline-block;background-color:#ffffff;color:{NAVY};'
+                f'border:1.5px solid {NAVY};padding:8px 16px;border-radius:6px;text-decoration:none;'
+                f'font-weight:600;font-size:12.5px;margin:0 8px 6px 0;">{label} &rarr;</a>')
+
+    preheader = (f"Votre guide de voyage personnalisé pour {location} : lieux incontournables, "
+                 f"plan d'organisation et liens utiles.")
+
+    # URL Claude avec le prompt pré-rempli dans la zone de saisie (le destinataire n'a plus qu'à appuyer sur Entrée)
+    import urllib.parse
+    claude_url = "https://claude.ai/new?q=" + urllib.parse.quote(ia_prompt)
+
+    body_html = f"""\
+<!DOCTYPE html>
+<html lang="fr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background-color:#eef1f4;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">{preheader}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#eef1f4;padding:32px 12px;">
+<tr><td align="center">
+<table role="presentation" width="620" cellpadding="0" cellspacing="0" style="max-width:620px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 2px 10px rgba(31,59,99,0.10);">
+
+  <!-- En-tête de marque -->
+  <tr><td style="padding:28px 36px 20px;text-align:center;">
+    <img src="cid:logo" alt="Place Explorer" width="72" style="display:block;margin:0 auto;max-width:72px;height:auto;">
+    <p style="margin:10px 0 0;font-size:13px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:{NAVY};">Place&nbsp;Explorer</p>
+  </td></tr>
+
+  <!-- Bannière -->
+  <tr><td style="padding:0;">
+    <img src="cid:travel" alt="Préparation de voyage" width="620" style="display:block;width:100%;height:auto;">
+  </td></tr>
+
+  <!-- Titre -->
+  <tr><td style="padding:32px 36px 6px;text-align:center;">
+    <span style="display:inline-block;background-color:#fdecea;color:{RED};font-size:11.5px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:6px 14px;border-radius:20px;margin-bottom:12px;">Guide voyage &middot; {vacation_month_cleaned.replace('-', ' ')}</span>
+    <h1 style="margin:0 0 8px;font-size:25px;font-weight:700;color:{NAVY};line-height:1.3;">Votre guide de voyage pour {location}</h1>
+    <p style="margin:0;font-size:15px;color:{TEXT};line-height:1.6;">
+      Bienvenue à bord&nbsp;! Découvrez <strong>{location}</strong>, une destination rêvée pour des aventures inoubliables.
+      Votre guide inclut les lieux incontournables à visiter et un plan d'organisation pour votre voyage.
+    </p>
+  </td></tr>
+
+  <!-- Encart pièce jointe -->
+  <tr><td style="padding:20px 36px 8px;">
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color:#f3f6fa;border:1px solid #dde5ee;border-radius:10px;">
+      <tr>
+        <td style="padding:16px 18px;font-size:24px;width:36px;vertical-align:middle;">📎</td>
+        <td style="padding:16px 18px 16px 0;font-size:13.5px;color:{TEXT};line-height:1.55;vertical-align:middle;">
+          <strong style="color:{NAVY};">Votre guide Excel est en pièce jointe.</strong><br>
+          Plus de 30 catégories (monuments, restaurants, plages, musées…), top 20 des lieux par popularité, liens Google&nbsp;Maps cliquables.
+        </td>
+      </tr>
+    </table>
+  </td></tr>
+
+  {itinerary_block}
+
+  <!-- Étapes -->
+  <tr><td style="padding:26px 36px 8px;">
+    {section_title('Organisation', 'Étapes pour organiser votre voyage')}
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+      {step('1', "Ouvrez le fichier Excel attaché avec <strong>Google&nbsp;Sheets</strong> en cliquant une fois dessus.")}
+      {step('2', "Consultez chaque feuille pour explorer les meilleures options par catégorie.")}
+      {step('3', "Planifiez vos activités (par exemple 2 par jour et par feuille), avec un calque par ville&nbsp;:",
+            small_btn('https://www.google.com/mymaps', 'Google My Maps'))}
+      {step('4', "Si le réseau est payant à l'étranger, utilisez Google Maps hors connexion&nbsp;:",
+            small_btn('https://support.google.com/maps/answer/6291838?hl=fr', 'Maps hors connexion'))}
+      {step('5', "Envoyez-vous votre parcours du jour (en fonction de la proximité) pour le garder à portée de main sur votre téléphone&nbsp;:",
+            small_btn('https://web.whatsapp.com', 'WhatsApp Web') +
+            small_btn('https://docs.google.com', 'Google Docs'))}
+    </table>
+  </td></tr>
+
+  <!-- Liens utiles -->
+  <tr><td style="padding:26px 36px 8px;">
+    {section_title('Ressources', 'Liens utiles pour votre voyage')}
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+      {useful('Vols', "Trouvez les vols les moins chers et obtenez des indemnisations en cas de retard.",
+              small_btn('https://www.skyscanner.fr/', 'Skyscanner') + small_btn('https://www.airhelp.com/fr/', 'AirHelp'))}
+      {useful('Transports', "Comparez tous les moyens de transport pour chaque trajet.",
+              small_btn('https://www.rome2rio.com/', 'Rome2Rio'))}
+      {useful('Hébergement &amp; véhicule', "Réservez votre logement et votre véhicule en quelques clics.",
+              small_btn('https://www.airbnb.com', 'Airbnb') + small_btn('https://www.booking.com', 'Booking.com'))}
+      {useful('Avis &amp; recommandations', "Consultez les avis des voyageurs avant de choisir.",
+              small_btn('https://www.tripadvisor.com', 'Tripadvisor'))}
+      {useful('Activités locales', "Réservez des visites et expériences sur place.",
+              small_btn('https://www.getyourguide.fr/', 'GetYourGuide'))}
+      {useful("Connexion à l'étranger", "Trouvez des eSIM à moindre coût pour rester connecté.",
+              small_btn('https://www.airalo.com/fr', 'Airalo'))}
+    </table>
+  </td></tr>
+
+  <!-- Offre Revolut -->
+  <tr><td style="padding:24px 36px 8px;">
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color:{NAVY};border-radius:12px;">
+      <tr><td style="padding:24px 26px;text-align:center;">
+        <p style="margin:0 0 4px;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#9fb3d1;">Offre partenaire</p>
+        <p style="margin:0 0 6px;font-size:17px;font-weight:700;color:#ffffff;">Dépensez sans frais de change à l'étranger</p>
+        <p style="margin:0 0 14px;font-size:13.5px;color:#d7e0ec;line-height:1.55;">Ouvrez un compte Revolut en quelques minutes.</p>
+        {btn('https://revolut.com/referral/?referral-code=romainavh3!DEC1-24-VR-FR', 'Ouvrir un compte Revolut', RED)}
+      </td></tr>
+    </table>
+  </td></tr>
+
+  <!-- Prompt Claude -->
+  <tr><td style="padding:26px 36px 8px;">
+    {section_title('Assistant IA', 'Enrichissez votre expérience')}
+    <p style="margin:0 0 12px;font-size:14px;color:{TEXT};line-height:1.6;">
+      Cliquez sur le bouton ci-dessous&nbsp;: <strong>Claude</strong> s'ouvre avec ce prompt déjà saisi, il ne reste qu'à appuyer sur Entrée pour obtenir un programme complet et personnalisé&nbsp;:
+    </p>
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color:#f8f9fa;border-left:4px solid {NAVY};border-radius:0 8px 8px 0;">
+      <tr><td style="padding:16px 18px;">
+        <p style="margin:0;font-size:12.5px;color:#444746;line-height:1.65;font-family:Consolas,'Courier New',monospace;">"{ia_prompt}"</p>
+      </td></tr>
+    </table>
+    <div style="text-align:center;margin-top:16px;">
+      {btn(claude_url, 'Ouvrir Claude - prompt pré-rempli')}
+    </div>
+  </td></tr>
+
+  <!-- Bon voyage -->
+  <tr><td style="padding:28px 36px 24px;text-align:center;">
+    <p style="margin:0;font-size:15px;color:{NAVY};font-weight:700;">Nous espérons que vous passerez un moment incroyable. Bon voyage&nbsp;!</p>
+  </td></tr>
+
+  <!-- Pied de page -->
+  <tr><td style="padding:26px 36px 30px;background-color:#f7f9fb;border-top:1px solid #e8ecf1;text-align:center;">
+    <p style="margin:0 0 10px;font-size:13px;color:{TEXT};line-height:1.6;">
+      Ce guide vous a été utile&nbsp;? Soutenez le projet d'un don via <strong>PayPal</strong>
+      à l'adresse <a href="mailto:romtaug@gmail.com" style="color:{NAVY};font-weight:600;text-decoration:none;">romtaug@gmail.com</a>
+      ou en scannant ce QR&nbsp;code&nbsp;:
+    </p>
+    <img src="cid:qrcode" alt="QR code don PayPal" width="110" style="display:block;margin:8px auto 14px;max-width:110px;height:auto;border-radius:8px;border:1px solid #e0e5ea;">
+    <p style="margin:0 0 10px;font-size:13px;color:{TEXT};">Découvrez aussi notre outil pour travailler à l'étranger&nbsp;:</p>
+    {small_btn('https://bordeuroconnect.netlify.app/', 'BordEuro Connect')}
+    <p style="margin:18px 0 0;font-size:11.5px;color:{MUTED};line-height:1.6;">
+      Vous recevez cet e-mail car un guide Place&nbsp;Explorer a été généré pour vous.<br>
+      Place&nbsp;Explorer - Guide de voyage automatisé
+    </p>
+  </td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+
+    return body_plain, body_html
+
+
+def send_email_with_excel(sender_email, password, receiver_emails, subject,
+                          body_plain, body_html, file_path, image_paths):
+    msg = MIMEMultipart('mixed')
+    msg['From'] = sender_email
+    msg['To'] = ", ".join(receiver_emails)
+    msg['Subject'] = subject
+
+    # Corps : alternative (texte brut + HTML avec images inline)
+    alt = MIMEMultipart('alternative')
+    alt.attach(MIMEText(body_plain, 'plain', 'utf-8'))
+
+    related = MIMEMultipart('related')
+    related.attach(MIMEText(body_html, 'html', 'utf-8'))
+
+    # Images intégrées au corps HTML (cid:logo, cid:travel, cid:qrcode)
+    for image_path in image_paths:
+        cid = os.path.splitext(os.path.basename(image_path))[0]  # logo / travel / qrcode
+        if os.path.exists(image_path):
+            with open(image_path, 'rb') as img:
+                img_part = MIMEImage(img.read())
+            img_part.add_header('Content-ID', f'<{cid}>')
+            img_part.add_header('Content-Disposition', 'inline',
+                                filename=os.path.basename(image_path))
+            related.attach(img_part)
+        else:
+            print(f"Image non trouvée (ignorée) : {image_path}")
+
+    alt.attach(related)
+    msg.attach(alt)
+
+    # Pièce jointe Excel
+    try:
+        with open(file_path, 'rb') as file:
+            part = MIMEBase('application', "octet-stream")
+            part.set_payload(file.read())
+        encoders.encode_base64(part)
+        normalized_name = normalize_filename(os.path.basename(file_path))
+        part.add_header('Content-Disposition', f'attachment; filename="{normalized_name}"')
+        msg.attach(part)
+    except FileNotFoundError:
+        print(f"Fichier non trouvé : {file_path}")
+        return
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(sender_email, password)
+            server.sendmail(sender_email, receiver_emails, msg.as_string())
+            print(f"✅ E-mail envoyé avec succès à {', '.join(receiver_emails)}")
+    except Exception as e:
+        print(f"❌ Erreur lors de l'envoi de l'e-mail : {e}")
+        sys.exit(1)
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        excel_file, location, vacation_month, places_by_category = create_excel_file(API_KEY, LOCATION, VACATION_MONTH)
+        remove_invalid_rows(excel_file, location)
+        style_workbook(excel_file)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"❌ Erreur lors de la création du fichier Excel : {e}")
+        sys.exit(1)
+
+    location_cleaned = location.replace(",", "-").replace(" ", "")
+    vacation_month_cleaned = vacation_month.replace(" ", "-")
+
+    if not os.path.exists(excel_file):
+        print(f"❌ Le fichier Excel n'a pas été trouvé : {excel_file}")
+        sys.exit(1)
+
+    # Garde-fou : vérifier que l'Excel contient des données avant d'envoyer
+    wb_check = load_workbook(excel_file, read_only=True)
+    total_rows = 0
+    for sheet_name in wb_check.sheetnames:
+        n = sum(1 for _ in wb_check[sheet_name].iter_rows(min_row=2))
+        total_rows += n
+        print(f"   📄 {sheet_name} : {n} lieux")
+    wb_check.close()
+    print(f"📊 Total : {total_rows} lieux dans {len(wb_check.sheetnames)} feuilles")
+    if total_rows == 0:
+        print("❌ Le fichier Excel est vide (0 lieu) - envoi annulé.")
+        print("   Causes probables : statut API en erreur (voir ⚠️ ci-dessus) ou filtre pays trop strict.")
+        sys.exit(1)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    image_paths = [
+        os.path.join(script_dir, "Image", "logo.png"),
+        os.path.join(script_dir, "Image", "travel.png"),
+        os.path.join(script_dir, "Image", "qrcode.png"),
+    ]
+
+    # --- Itinéraire du jour : top populaire + ordre optimisé + carte + temps réel ---
+    itinerary_block, itinerary_plain = "", ""
+    itin = build_day_itinerary(places_by_category, api_key=API_KEY)
+    if itin:
+        print("🗺️ Itinéraire du jour :")
+        print(describe(itin["sequence"]))
+        if itin.get("distance_txt"):
+            print(f"   {itin['distance_txt']} · {itin['duration_txt']} de marche")
+        print(itin["url"])
+        map_path = os.path.join(script_dir, "routemap.png")
+        if download_static_map(itin, API_KEY, map_path):
+            itin["has_map"] = True
+            image_paths.append(map_path)   # cid:routemap -> aperçu dans l'email
+        itinerary_block = itinerary_email_block(itin)
+        itinerary_plain = itinerary_plain_block(itin)
+
+    subject = f"🌍 PlaceExplorer : Les Meilleurs Lieux Destination {location_cleaned} en {vacation_month_cleaned}"
+    body_plain, body_html = build_email_bodies(location, location_cleaned, vacation_month_cleaned,
+                                               itinerary_block=itinerary_block, itinerary_plain=itinerary_plain)
+
+    send_email_with_excel(SENDER_EMAIL, GMAIL_APP_PASSWORD, RECEIVER_EMAILS,
+                          subject, body_plain, body_html, excel_file, image_paths)
+
+    # Déplacer l'Excel dans Content/ (récupéré ensuite comme artifact par le workflow)
+    content_dir = os.path.join(script_dir, "Content")
+    os.makedirs(content_dir, exist_ok=True)
+    destination = os.path.join(content_dir, os.path.basename(excel_file))
+    shutil.move(excel_file, destination)
+    print(f"✅ Fichier déplacé dans le dossier Content : {destination}")
