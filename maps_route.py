@@ -97,14 +97,15 @@ def _top(places, k=None):
 
 # ── Lien Google Maps : format "path" (prend TOUS les arrêts, sans plafond) ──
 # Même approche que tour_url de thermodata_engine : .../dir/A/B/C/...
-# Le format api=1 plafonne à ~9 waypoints (tronque au-delà) ; le format path
-# avale toute la liste. Adresse de préférence (lisible), sinon coordonnées.
+# On utilise les COORDONNÉES GPS (précises et uniques par lieu) plutôt que les
+# adresses : les adresses Google Places sont souvent vagues (code postal seul)
+# ou dupliquées entre lieux, ce qui empêche Maps de tracer. Les coords, jamais.
 def _loc(s):
-    if s.get("Address"):
-        return urllib.parse.quote(str(s["Address"]).strip())
     c = _coords(s)
     if c:
         return f"{c[0]},{c[1]}"
+    if s.get("Address"):
+        return urllib.parse.quote(str(s["Address"]).strip())
     return urllib.parse.quote(str(s.get("Name", "")).strip())
 
 
