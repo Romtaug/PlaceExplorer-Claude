@@ -737,21 +737,31 @@ if __name__ == "__main__":
         os.path.join(script_dir, "Image", "qrcode.png"),
     ]
 
-    # --- Itinéraire du jour : top populaire + ordre optimisé + carte + temps réel ---
+    # --- Itinéraire du jour : UNIQUEMENT pour une ville ---------------------
+    # Une virgule dans la destination = format "Ville, Pays" -> on génère le
+    # parcours à pied. Sans virgule = pays entier -> pas d'itinéraire : il
+    # s'ancrerait sur un point arbitraire (ex. Trakai au lieu de Vilnius) et
+    # perdrait souvent le déjeuner / dîner / bar. L'Excel, lui, reste complet.
     itinerary_block, itinerary_plain = "", ""
-    itin = build_day_itinerary(places_by_category, api_key=API_KEY)
-    if itin:
-        print("🗺️ Itinéraire du jour :")
-        print(describe(itin["sequence"]))
-        if itin.get("distance_txt"):
-            print(f"   {itin['distance_txt']} · {itin['duration_txt']} de marche")
-        print(itin["url"])
-        map_path = os.path.join(script_dir, "routemap.png")
-        if download_static_map(itin, API_KEY, map_path):
-            itin["has_map"] = True
-            image_paths.append(map_path)   # cid:routemap -> aperçu dans l'email
-        itinerary_block = itinerary_email_block(itin)
-        itinerary_plain = itinerary_plain_block(itin)
+    is_city = "," in location
+    if is_city:
+        itin = build_day_itinerary(places_by_category, api_key=API_KEY)
+        if itin:
+            print("🗺️ Itinéraire du jour :")
+            print(describe(itin["sequence"]))
+            if itin.get("distance_txt"):
+                print(f"   {itin['distance_txt']} · {itin['duration_txt']} de marche")
+            print(itin["url"])
+            map_path = os.path.join(script_dir, "routemap.png")
+            if download_static_map(itin, API_KEY, map_path):
+                itin["has_map"] = True
+                image_paths.append(map_path)   # cid:routemap -> aperçu dans l'email
+            itinerary_block = itinerary_email_block(itin)
+            itinerary_plain = itinerary_plain_block(itin)
+    else:
+        print("ℹ️ Destination = pays entier -> pas d'itinéraire d'une journée "
+              "(le parcours à pied n'a de sens que pour une ville). "
+              "Précise une ville (ex : 'Vilnius, Lithuania') pour l'obtenir.")
 
     subject = f"🌍 PlaceExplorer : Les Meilleurs Lieux Destination {location_cleaned} en {vacation_month_cleaned}"
     body_plain, body_html = build_email_bodies(location, location_cleaned, vacation_month_cleaned,
