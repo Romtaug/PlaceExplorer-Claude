@@ -12,7 +12,7 @@ on:
         required: true
         default: "Août, 2026"
       receiver_emails:
-        description: "Destinataires (séparés par des virgules)"
+        description: "Destinataires, séparés par des virgules (ex : a@mail.com, b@mail.com). Laisser vide = envoi à romtaug@gmail.com."
         required: false
         default: "romtaug@gmail.com"
 
