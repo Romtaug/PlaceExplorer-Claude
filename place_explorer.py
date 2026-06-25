@@ -104,11 +104,20 @@ def extract_city_from_address(full_address):
 # ----------------------------------------------------------------------------
 # Google Places
 # ----------------------------------------------------------------------------
+def _extract_country(details):
+    """Renvoie (pays_long, code_pays) depuis address_components, ex. ('Japan', 'JP').
+    Plus fiable que de parser la fin de formatted_address."""
+    for comp in (details.get('address_components') or []):
+        if 'country' in (comp.get('types') or []):
+            return comp.get('long_name'), comp.get('short_name')
+    return None, None
+
+
 def get_place_details(place_id, api_key):
     details_url = "https://maps.googleapis.com/maps/api/place/details/json"
     details_params = {
         'place_id': place_id,
-        'fields': 'name,formatted_address,rating,user_ratings_total,price_level,international_phone_number,website,geometry/location',
+        'fields': 'name,formatted_address,rating,user_ratings_total,price_level,international_phone_number,website,geometry/location,address_components',
         'language': 'en',
         'key': api_key
     }
@@ -142,6 +151,7 @@ def search_places(api_key, location, category):
         details = get_place_details(place_id, api_key)
         if details:
             full_address = details.get('formatted_address', 'Not specified')
+            country_long, country_short = _extract_country(details)
             detailed_places.append({
                 'City': extract_city_from_address(full_address),
                 'Address': full_address,
@@ -155,6 +165,8 @@ def search_places(api_key, location, category):
                 'PlaceID': place_id,
                 'Lat': (details.get('geometry') or {}).get('location', {}).get('lat'),
                 'Lng': (details.get('geometry') or {}).get('location', {}).get('lng'),
+                'Country': country_long,
+                'CountryCode': country_short,
             })
         time.sleep(0.05)
     return detailed_places
@@ -260,23 +272,58 @@ def style_workbook(file_path):
     print(f"✅ Classeur stylisé : {file_path}")
 
 
-def remove_invalid_rows(file_path, location):
-    country = location.split(",")[-1].strip()
-    print(f"Filtrage des lignes se terminant par : {country}")
-    wb = load_workbook(file_path)
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        rows_to_delete = []
-        for row in ws.iter_rows(min_row=2):
-            cell = row[1]  # colonne Address
-            if cell.value and isinstance(cell.value, str):
-                cell_value_normalized = " ".join(cell.value.split())
-                if not cell_value_normalized.lower().endswith(country.lower()):
-                    rows_to_delete.append(cell.row)
-        for row_idx in sorted(set(rows_to_delete), reverse=True):
-            ws.delete_rows(row_idx)
-    wb.save(file_path)
-    print(f"✅ Lignes se terminant par '{country}' conservées dans : {file_path}")
+def _norm_txt(s):
+    """minuscule + sans accents, pour comparer des noms de pays sereinement."""
+    s = unicodedata.normalize('NFD', str(s or ''))
+    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+    return s.strip().lower()
+
+
+def filter_by_country(places_by_category, location):
+    """Garde uniquement les lieux situés dans le pays demandé, en s'appuyant sur
+    le composant 'country' renvoyé par l'API (et non sur la fin de l'adresse).
+    - Tolérant : un lieu sans info pays est conservé.
+    - Garde-fou : si AUCUN lieu ne matche (ex. pays mal orthographié ou tapé
+      dans une autre langue), on n'applique PAS le filtre plutôt que de vider
+      le guide. Les résultats restent pertinents car la requête Places est déjà
+      géocodée sur le bon pays.
+    """
+    requested = _norm_txt(location.split(",")[-1])
+    if not requested:
+        return places_by_category
+
+    def has_country(p):
+        return bool(_norm_txt(p.get('Country')) or _norm_txt(p.get('CountryCode')))
+
+    def matches(p):
+        cl, cc = _norm_txt(p.get('Country')), _norm_txt(p.get('CountryCode'))
+        return (requested == cl or requested == cc
+                or requested in cl or cl in requested)
+
+    all_places = [p for v in places_by_category.values() for p in v]
+    total = len(all_places)
+    with_country = [p for p in all_places if has_country(p)]
+    matched = [p for p in with_country if matches(p)]
+
+    # Garde-fou anti-vidage : si des lieux ont une info pays mais qu'AUCUN ne
+    # matche (pays tapé dans une autre langue, ex. 'Japon' vs 'Japan', ou faute
+    # de frappe), on n'applique PAS le filtre. La requête Places étant déjà
+    # géocodée sur le bon pays, les résultats restent pertinents.
+    label = location.split(",")[-1].strip()
+    if with_country and not matched:
+        print(f"⚠️ Filtre pays '{label}' : 0 correspondance sur les lieux "
+              f"géolocalisés -> filtre ignoré (vérifie l'orthographe / la langue).")
+        return places_by_category
+
+    # On garde : les lieux qui matchent + ceux sans info pays (on ne les jette pas).
+    def ok(p):
+        return matches(p) if has_country(p) else True
+
+    kept = {c: [p for p in places if ok(p)] for c, places in places_by_category.items()}
+    kept = {c: v for c, v in kept.items() if v}
+    kept_total = sum(len(v) for v in kept.values())
+    print(f"✅ Filtre pays '{label}' : {kept_total}/{total} lieux conservés.")
+    return kept
 
 
 CATEGORIES = {
@@ -334,7 +381,7 @@ def create_excel_file(api_key, location, vacation_month):
     file_name = f"{sanitized_location}_{vacation_month}.xlsx"
     file_path = os.path.join(script_dir, file_name)
 
-    writer = pd.ExcelWriter(file_path, engine='openpyxl')
+    # 1) Récupération de tous les lieux par catégorie
     places_by_category = {}
     for category, description in CATEGORIES.items():
         print(f"Fetching data for category: {category}")
@@ -344,10 +391,21 @@ def create_excel_file(api_key, location, vacation_month):
             for p in data:
                 p['_category'] = label
             places_by_category[category] = data
-            df = pd.DataFrame(data).sort_values(by='Total Reviews', ascending=False)
-            df = df.drop(columns=['PlaceID', 'Lat', 'Lng', '_category'], errors='ignore')  # Excel inchangé
-            sheet_name = description if len(description) <= 31 else description[:31]
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    # 2) Filtre pays robuste (composant API, tolérant à la langue, anti-vidage)
+    places_by_category = filter_by_country(places_by_category, location)
+
+    # 3) Écriture Excel (colonnes techniques retirées, classeur inchangé)
+    writer = pd.ExcelWriter(file_path, engine='openpyxl')
+    for category, data in places_by_category.items():
+        if not data:
+            continue
+        description = CATEGORIES[category]
+        df = pd.DataFrame(data).sort_values(by='Total Reviews', ascending=False)
+        df = df.drop(columns=['PlaceID', 'Lat', 'Lng', '_category',
+                              'Country', 'CountryCode'], errors='ignore')
+        sheet_name = description if len(description) <= 31 else description[:31]
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
     writer.close()
 
     adjust_column_width(file_path)
@@ -360,11 +418,12 @@ def create_excel_file(api_key, location, vacation_month):
 # ----------------------------------------------------------------------------
 def build_email_bodies(location, location_cleaned, vacation_month_cleaned, itinerary_block="", itinerary_plain=""):
     ia_prompt = (
-        f"Je cherche des expériences extraordinaires à {location_cleaned} en {vacation_month_cleaned}, "
-        "fais un top 20 des incontournables durant cette période (événements et activités) "
-        "et un top 10 des villes à visiter autour avec le temps de trajet, indique les démarches administratives nécessaires "
-        "(documents, visas, vaccins), les précautions à prendre (arnaques, numéros d'urgence), les coûts approximatifs, "
-        "la météo moyenne, les événements locaux, et des astuces pour se déplacer, respecter les coutumes, et profiter au maximum."
+        f"Je prépare un voyage : {location}, en {vacation_month_cleaned.replace('-', ' ')}. "
+        "Fais-moi un top 20 des incontournables sur cette période (événements et activités), "
+        "un top 10 des villes ou quartiers à visiter autour avec le temps de trajet, et indique "
+        "les démarches administratives nécessaires (documents, visas, vaccins), les précautions à "
+        "prendre (arnaques, numéros d'urgence), les coûts approximatifs, la météo moyenne, les "
+        "événements locaux, et des astuces pour se déplacer, respecter les coutumes et profiter au maximum."
     )
 
     import urllib.parse as _up
@@ -643,7 +702,6 @@ def send_email_with_excel(sender_email, password, receiver_emails, subject,
 if __name__ == "__main__":
     try:
         excel_file, location, vacation_month, places_by_category = create_excel_file(API_KEY, LOCATION, VACATION_MONTH)
-        remove_invalid_rows(excel_file, location)
         style_workbook(excel_file)
     except SystemExit:
         raise
