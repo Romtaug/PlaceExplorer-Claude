@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       location:
-        description: "Destination EN ANGLAIS (ex : Lisbon, Portugal — le pays anglais est obligatoire)"
+        description: "Destination EN ANGLAIS - ville+pays (ex : Lisbon, Portugal) ou pays seul (ex : Portugal). Le nom du pays en anglais est obligatoire."
         required: true
         default: "Lisbon, Portugal"
       vacation_month:
