@@ -130,11 +130,12 @@ def _median(vals):
     return s[m] if n % 2 else (s[m - 1] + s[m]) / 2.0
 
 
-def _filter_walkable(groups, max_km):
+def _filter_walkable(groups, max_km, anchor=None):
     """
     Écarte les lieux trop loin du cœur géographique du groupe.
-    `groups` = liste de listes de lieux. Le cœur = médiane des positions de TOUS
-    les lieux (robuste : un lieu isolé à 1000 km ne déplace pas la médiane).
+    `groups` = liste de listes de lieux. Le cœur = `anchor` s'il est fourni
+    (coordonnées du lieu le plus populaire), sinon la médiane des positions de
+    TOUS les lieux (robuste : un lieu isolé à 1000 km ne déplace pas la médiane).
     Renvoie les mêmes listes filtrées. Si max_km est None : ne filtre rien.
     """
     if not max_km:
@@ -142,8 +143,11 @@ def _filter_walkable(groups, max_km):
     pts = [_coords(p) for g in groups for p in g if _coords(p)]
     if len(pts) < 3:                      # pas assez de points pour un cœur fiable
         return groups, None
-    clat = _median([la for la, _ in pts])
-    clng = _median([lo for _, lo in pts])
+    if anchor:
+        clat, clng = anchor
+    else:
+        clat = _median([la for la, _ in pts])
+        clng = _median([lo for _, lo in pts])
     max_m = max_km * 1000.0                # hav() renvoie des mètres
     out = []
     for g in groups:
@@ -239,11 +243,23 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS, tra
     # Garde-fou : on retire du parcours à pied les lieux trop loin du cœur
     # (Sintra, Cabo da Roca, résultats parasites à l'étranger...). L'Excel, lui,
     # garde tout — ce filtre n'agit que sur l'itinéraire.
+    #
+    # Ancre du cœur = le lieu touristique LE PLUS POPULAIRE (avec coords).
+    #   - Ville : c'est le centre touristique -> comportement inchangé.
+    #   - Pays : c'est la ville n°1 -> évite que la médiane tombe « au milieu de
+    #     nulle part » et fasse disparaître l'itinéraire ; on garde donc un vrai
+    #     parcours dans la ville phare. Le rayon MAX_KM_FROM_CORE le borne.
+    anchor = None
+    pool = [p for p in visits if _coords(p)]
+    if pool:
+        top = max(pool, key=lambda p: p.get("Total Reviews", 0) or 0)
+        anchor = _coords(top)
+
     (visits, restos, bars), core = _filter_walkable([visits, restos, bars],
-                                                     MAX_KM_FROM_CORE)
+                                                     MAX_KM_FROM_CORE, anchor=anchor)
     if core and MAX_KM_FROM_CORE:
         print(f"🚶 Garde-fou parcours : lieux gardés à ≤{MAX_KM_FROM_CORE:g} km "
-              f"du cœur ({core[0]:.4f}, {core[1]:.4f})")
+              f"du lieu le plus populaire ({core[0]:.4f}, {core[1]:.4f})")
 
     # Dédup : un même lieu peut être dans plusieurs catégories de l'Excel.
     visits, restos, bars = _dedup(visits), _dedup(restos), _dedup(bars)
