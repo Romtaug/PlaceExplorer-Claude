@@ -17,6 +17,7 @@ Nécessite 'Lat'/'Lng'/'PlaceID' sur chaque lieu (cf. intégration).
 """
 
 import math
+import os
 import urllib.parse
 import requests
 
@@ -31,7 +32,7 @@ N_VISITS = 10
 # les lieux trop loin du cœur géographique (médiane des positions, robuste aux
 # outliers). N'affecte QUE l'itinéraire — l'Excel garde tous les lieux.
 # Mettre None pour désactiver (= pur populaire, sans filtre distance).
-MAX_KM_FROM_CORE = 5.0
+MAX_KM_FROM_CORE = 30.0
 
 FOOD_CATEGORIES = {"restaurants"}
 BAR_CATEGORIES = {"bars", "nightclubs"}            # bar OU club, le plus populaire
@@ -156,6 +157,32 @@ def _filter_walkable(groups, max_km, anchor=None):
     return out, (clat, clng)
 
 
+def _densest_anchor(visits, radius_km, pool_size=40):
+    """Ancre du parcours = le lieu populaire entouré du PLUS GRAND NOMBRE d'autres
+    lieux populaires dans le rayon de marche (densité), départagé par le total
+    d'avis cumulé dans ce rayon.
+
+    Pourquoi : un site unique très visité mais isolé (Trakai en Lituanie, Sintra
+    au Portugal) ne doit pas l'emporter sur un vrai centre-ville dense (Vilnius,
+    Lisbonne). On raisonne sur les `pool_size` lieux les plus populaires pour
+    ignorer le bruit. Pour une VILLE en entrée, le centre reste la zone la plus
+    dense -> comportement inchangé.
+    """
+    pts = [p for p in visits if _coords(p)]
+    if not pts:
+        return None
+    pool = _top(pts, pool_size)
+    radius_m = radius_km * 1000.0
+    best, best_key = None, None
+    for c in pool:
+        cla, clo = _coords(c)
+        near = [v for v in pool if hav(cla, clo, *_coords(v)) <= radius_m]
+        key = (len(near), sum(v.get("Total Reviews", 0) or 0 for v in near))
+        if best_key is None or key > best_key:
+            best_key, best = key, c
+    return _coords(best)
+
+
 # ── Lien Google Maps : format "path" (prend TOUS les arrêts, sans plafond) ──
 # Même approche que tour_url de thermodata_engine : .../dir/A/B/C/...
 # On utilise les COORDONNÉES GPS (précises et uniques par lieu) plutôt que les
@@ -220,11 +247,16 @@ def walking_distance_time(stops, api_key):
 
 
 # ── Itinéraire d'une journée ──────────────────────────────────────
-def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS, travelmode="walking"):
+def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS,
+                        travelmode="walking", anchor=None):
     """
     Retourne un dict :
       { 'url', 'sequence', 'distance_m', 'duration_s', 'distance_txt', 'duration_txt' }
     ou None si pas assez de données.
+
+    `anchor` : (lat, lng) du centre imposé (ex. ville géocodée). S'il est fourni,
+    le parcours se centre dessus -> fiable même si Google a ramené des lieux
+    d'une autre ville. Sinon, on retombe sur la zone la plus dense des résultats.
     """
     visits, restos, bars = [], [], []
     for cat, places in places_by_category.items():
@@ -240,26 +272,46 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS, tra
             else:
                 visits.append(p)
 
-    # Garde-fou : on retire du parcours à pied les lieux trop loin du cœur
-    # (Sintra, Cabo da Roca, résultats parasites à l'étranger...). L'Excel, lui,
-    # garde tout — ce filtre n'agit que sur l'itinéraire.
+    # Garde-fou : on retire du parcours à pied les lieux trop loin du cœur.
+    # L'Excel, lui, garde tout — ce filtre n'agit que sur l'itinéraire.
     #
-    # Ancre du cœur = le lieu touristique LE PLUS POPULAIRE (avec coords).
-    #   - Ville : c'est le centre touristique -> comportement inchangé.
-    #   - Pays : c'est la ville n°1 -> évite que la médiane tombe « au milieu de
-    #     nulle part » et fasse disparaître l'itinéraire ; on garde donc un vrai
-    #     parcours dans la ville phare. Le rayon MAX_KM_FROM_CORE le borne.
-    anchor = None
-    pool = [p for p in visits if _coords(p)]
-    if pool:
-        top = max(pool, key=lambda p: p.get("Total Reviews", 0) or 0)
-        anchor = _coords(top)
+    # Cœur du parcours, par ordre de priorité :
+    #   1) `anchor` imposé = coordonnées de la ville géocodée (le plus fiable :
+    #      on reste sur la ville DEMANDÉE, même si Google a ramené des lieux
+    #      d'une autre ville pour une catégorie absente localement) ;
+    #   2) sinon, la zone la plus dense en lieux populaires (_densest_anchor),
+    #      qui évite qu'un site isolé hyper-visité (Trakai, Sintra) l'emporte.
+    # Le rayon MAX_KM_FROM_CORE borne le tout à une distance marchable.
+    anchor_src = "ville géocodée" if anchor else "zone la plus dense"
+    if anchor is None and MAX_KM_FROM_CORE:
+        anchor = _densest_anchor(visits, MAX_KM_FROM_CORE)
 
-    (visits, restos, bars), core = _filter_walkable([visits, restos, bars],
-                                                     MAX_KM_FROM_CORE, anchor=anchor)
-    if core and MAX_KM_FROM_CORE:
-        print(f"🚶 Garde-fou parcours : lieux gardés à ≤{MAX_KM_FROM_CORE:g} km "
-              f"du lieu le plus populaire ({core[0]:.4f}, {core[1]:.4f})")
+    # Rayon ADAPTATIF : on part d'un rayon de marche serré et on l'élargit par
+    # paliers UNIQUEMENT s'il manque de quoi remplir le parcours complet
+    # (10 visites + 2 restos + 1 bar = 13 étapes). Une grande ville (Vilnius)
+    # reste à ~5 km ; une petite ville (Šiauliai) s'élargit pour aller chercher
+    # de quoi compléter, sans dépasser le plafond (sinon on sauterait sur une
+    # autre ville). Réglable : ITINERARY_BASE_KM / ITINERARY_STEP_KM / ITINERARY_MAX_KM.
+    base_km = float(os.environ.get("ITINERARY_BASE_KM", MAX_KM_FROM_CORE or 30.0))
+    step_km = float(os.environ.get("ITINERARY_STEP_KM", 5.0))
+    max_km = float(os.environ.get("ITINERARY_MAX_KM", 30.0))
+    want_v, want_r, want_b = n_visits, 2, 1
+
+    visits, restos, bars, core, used_km = visits, restos, bars, None, base_km
+    r = base_km
+    while True:
+        (fv, fr, fb), c = _filter_walkable([visits, restos, bars], r, anchor=anchor)
+        cand = (fv, fr, fb, c, r)
+        enough = (len(_dedup(fv)) >= want_v and len(_dedup(fr)) >= want_r
+                  and len(_dedup(fb)) >= want_b)
+        if enough or r >= max_km or not c:
+            visits, restos, bars, core, used_km = cand
+            break
+        r += step_km
+
+    if core:
+        print(f"🚶 Garde-fou parcours : rayon {used_km:g} km autour du centre "
+              f"({anchor_src} : {core[0]:.4f}, {core[1]:.4f})")
 
     # Dédup : un même lieu peut être dans plusieurs catégories de l'Excel.
     visits, restos, bars = _dedup(visits), _dedup(restos), _dedup(bars)
@@ -304,6 +356,156 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS, tra
         "duration_txt": _fmt_dur(dur),
         "has_map": False,   # passe à True quand la carte statique est téléchargée
     }
+
+
+# ── Plan MULTI-JOURS ──────────────────────────────────────────────
+# On récupère un large pool de lieux (rayon MAX_KM_FROM_CORE autour de la ville),
+# on le découpe en N zones géographiques (clustering équilibré), et chaque zone
+# devient une journée : ordre optimisé (2-opt) + déjeuner + dîner + bar du coin.
+# Ainsi un grand rayon reste cohérent : l'étalement est absorbé par le découpage.
+def _balanced_clusters(pts, k, cap):
+    """k zones géographiques ÉQUILIBRÉES (<= cap points chacune).
+    Centres en farthest-first, puis affectation capacitée au plus proche."""
+    n = len(pts)
+    if k <= 1 or n == 0:
+        return [0] * n
+    centers = [pts[0]]
+    while len(centers) < k:
+        far = max(pts, key=lambda p: min(hav(p[0], p[1], c[0], c[1]) for c in centers))
+        centers.append(far)
+    assign = [0] * n
+    for _ in range(30):
+        counts = [0] * k
+        assign = [-1] * n
+        pairs = sorted((hav(pts[i][0], pts[i][1], centers[c][0], centers[c][1]), i, c)
+                       for i in range(n) for c in range(k))
+        for _d, i, c in pairs:
+            if assign[i] != -1 or counts[c] >= cap:
+                continue
+            assign[i] = c
+            counts[c] += 1
+        for i in range(n):                       # reste éventuel -> zone la moins pleine
+            if assign[i] == -1:
+                cand = [c for c in range(k) if counts[c] < cap] or list(range(k))
+                c = min(cand, key=lambda c: hav(pts[i][0], pts[i][1], centers[c][0], centers[c][1]))
+                assign[i] = c
+                counts[c] += 1
+        newc = []
+        for c in range(k):
+            cp = [pts[i] for i in range(n) if assign[i] == c]
+            newc.append((sum(x for x, _ in cp) / len(cp), sum(y for _, y in cp) / len(cp))
+                        if cp else centers[c])
+        if newc == centers:
+            break
+        centers = newc
+    return assign
+
+
+def _order_by_proximity(centroids, anchor):
+    """Ordonne les jours du plus proche au plus loin de l'ancre (nearest-neighbor)."""
+    k = len(centroids)
+    if k <= 1:
+        return list(range(k))
+    cur = anchor or centroids[0]
+    rest, order = set(range(k)), []
+    while rest:
+        nxt = min(rest, key=lambda c: hav(cur[0], cur[1], centroids[c][0], centroids[c][1]))
+        order.append(nxt)
+        rest.discard(nxt)
+        cur = centroids[nxt]
+    return order
+
+
+def _nearest_unused(places, center, used, k):
+    """k lieux les plus proches du centre du jour, non déjà utilisés (repas/bar)."""
+    cand = [p for p in places
+            if (p.get("PlaceID") or id(p)) not in used and _coords(p)]
+    cand.sort(key=lambda p: hav(center[0], center[1], *_coords(p)))
+    chosen = cand[:k]
+    for p in chosen:
+        used.add(p.get("PlaceID") or id(p))
+    return chosen
+
+
+def build_multiday_plan(places_by_category, days, anchor=None,
+                        api_key=None, n_visits=N_VISITS):
+    """Plan sur `days` jours. Chaque jour vise 13 étapes (n_visits visites +
+    déjeuner + dîner + bar), regroupées par zone géographique puis ordre optimisé.
+    Renvoie une liste de dicts {day, sequence, url, distance_txt, duration_txt}
+    ou [] si pas assez de données. `feasible_days` = limité par le nb de lieux."""
+    if not days or days < 1:
+        return []
+
+    visits, restos, bars = [], [], []
+    for cat, places in places_by_category.items():
+        for p in places:
+            if not _coords(p):
+                continue
+            if cat in FOOD_CATEGORIES:
+                restos.append(p)
+            elif cat in BAR_CATEGORIES:
+                bars.append(p)
+            elif cat in NON_TOURIST:
+                continue
+            else:
+                visits.append(p)
+
+    if anchor is None and MAX_KM_FROM_CORE:
+        anchor = _densest_anchor(visits, MAX_KM_FROM_CORE)
+    (visits, restos, bars), _core = _filter_walkable([visits, restos, bars],
+                                                      MAX_KM_FROM_CORE, anchor=anchor)
+
+    visits, restos, bars = _dedup(visits), _dedup(restos), _dedup(bars)
+    vids = {v.get("PlaceID") for v in visits if v.get("PlaceID")}
+    restos = [r for r in restos if r.get("PlaceID") not in vids]
+    bars = [b for b in bars if b.get("PlaceID") not in vids]
+
+    if len(visits) < 2:
+        return []
+
+    # On ne crée pas plus de jours que la ville ne peut en remplir (>= 2 visites/jour)
+    feasible_days = max(1, min(int(days), len(visits) // 2))
+    pool = _top(visits, feasible_days * n_visits)
+    pts = [_coords(p) for p in pool]
+
+    assign = _balanced_clusters(pts, feasible_days, cap=n_visits)
+    centroids = []
+    for c in range(feasible_days):
+        cp = [pts[i] for i in range(len(pts)) if assign[i] == c]
+        centroids.append((sum(x for x, _ in cp) / len(cp), sum(y for _, y in cp) / len(cp))
+                         if cp else (anchor or pts[0]))
+
+    used_resto, used_bar = set(), set()
+    plan = []
+    for day_no, c in enumerate(_order_by_proximity(centroids, anchor), start=1):
+        day_visits = [pool[i] for i in range(len(pool)) if assign[i] == c]
+        if not day_visits:
+            continue
+        start = max(range(len(day_visits)),
+                    key=lambda i: day_visits[i].get("Total Reviews", 0) or 0)
+        seq = [dict(v, _step="🎯") for v in optimize_walking_order(day_visits, start)]
+        cen = centroids[c]
+        d_restos = _nearest_unused(restos, cen, used_resto, 2)
+        d_bar = _nearest_unused(bars, cen, used_bar, 1)
+        if len(d_restos) >= 1:
+            seq = _best_insert(seq, dict(d_restos[0], _step="🍴"))
+        if len(d_restos) >= 2:
+            seq.append(dict(d_restos[1], _step="🍽️"))
+        if d_bar:
+            seq.append(dict(d_bar[0], _step="🍹"))
+        dist, dur, _poly = walking_distance_time(seq, api_key)
+        plan.append({
+            "day": day_no,
+            "sequence": seq,
+            "url": build_route_url(seq, travelmode="walking"),
+            "distance_txt": _fmt_dist(dist),
+            "duration_txt": _fmt_dur(dur),
+        })
+    if feasible_days < int(days):
+        print(f"ℹ️ Plan multi-jours : {feasible_days} jour(s) au lieu de {int(days)} "
+              f"demandé(s) - pas assez de lieux dans la zone pour remplir plus.")
+    print(f"🗓️ Plan multi-jours : {len(plan)} jour(s) generes.")
+    return plan
 
 
 # ── Carte statique (image PNG du parcours) via Static Maps API ────
