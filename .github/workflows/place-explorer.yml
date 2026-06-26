@@ -15,6 +15,10 @@ on:
         description: "Destinataires, séparés par des virgules (ex : a@mail.com, b@mail.com). Laisser vide = envoi à romtaug@gmail.com."
         required: false
         default: "romtaug@gmail.com"
+      nb_days:
+        description: "Plan multi-jours (Excel séparé) : nombre de jours, ex 4. Laisser 0 = pas de plan multi-jours. Ville obligatoire (ex : Vilnius, Lithuania)."
+        required: false
+        default: "0"
 
 jobs:
   place-explorer:
@@ -40,6 +44,7 @@ jobs:
           LOCATION: ${{ inputs.location }}
           VACATION_MONTH: ${{ inputs.vacation_month }}
           RECEIVER_EMAILS: ${{ inputs.receiver_emails }}
+          NB_DAYS: ${{ inputs.nb_days }}
         run: python place_explorer.py
 
       - name: 📤 Upload Excel as artifact
