@@ -1,4 +1,4 @@
-name: 🌍 Place Explorer
+name: Place Explorer
 
 on:
   workflow_dispatch:
