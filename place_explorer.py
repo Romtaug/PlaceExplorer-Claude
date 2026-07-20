@@ -2,11 +2,15 @@
 """
 PlaceExplorer - version GitHub Actions
 - Lit la localisation et le mois depuis les variables d'environnement (inputs du workflow)
-- Génère l'Excel multi-feuilles (31 catégories, top 20 lieux triés par nombre d'avis)
-- Envoie un email HTML stylé depuis romtaug@gmail.com avec l'Excel (+ images si présentes) en pièce jointe
+- Google Places API (New) : 1 seul appel searchText par catégorie (32 catégories,
+  top 20 lieux avec note, avis, prix, horaires, site web, résumé éditorial)
+- Enrichissement Wikipédia gratuit (article + consultations mensuelles) pour
+  booster les incontournables dans l'itinéraire
+- Génère l'Excel multi-feuilles et envoie un email HTML stylé depuis
+  romtaug@gmail.com avec l'Excel (+ images si présentes) en pièce jointe
 
 Secrets requis (GitHub > Settings > Secrets and variables > Actions) :
-- GOOGLE_API_KEY      : clé API Google Places
+- GOOGLE_API_KEY      : clé API Google (avec "Places API (New)" ACTIVÉE dans GCP)
 - GMAIL_APP_PASSWORD  : mot de passe d'application Gmail de romtaug@gmail.com
 """
 
@@ -17,6 +21,8 @@ import time
 import shutil
 import smtplib
 import unicodedata
+import datetime as dt
+from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -106,30 +112,88 @@ def extract_city_from_address(full_address):
 
 
 # ----------------------------------------------------------------------------
-# Google Places
+# Google Places API (New) - https://places.googleapis.com/v1/places:searchText
+# UN SEUL appel par catégorie : le field mask ramène TOUTES les infos (note,
+# avis, prix, horaires, site web, résumé éditorial, types) pour les 20 lieux
+# d'un coup. Fini les ~600 appels Place Details du legacy (~632 -> ~32 appels
+# par exécution, largement dans le palier gratuit mensuel du SKU).
+# Prérequis console GCP : activer "Places API (New)" et l'autoriser sur la clé.
 # ----------------------------------------------------------------------------
-def _extract_country(details):
-    """Renvoie (pays_long, code_pays) depuis address_components, ex. ('Japan', 'JP').
-    Plus fiable que de parser la fin de formatted_address."""
-    for comp in (details.get('address_components') or []):
+PLACES_FIELD_MASK = ",".join(f"places.{f}" for f in (
+    "id", "displayName", "formattedAddress", "addressComponents", "location",
+    "types", "primaryType", "businessStatus", "rating", "userRatingCount",
+    "priceLevel", "internationalPhoneNumber", "websiteUri",
+    "regularOpeningHours", "editorialSummary",
+))
+
+_PRICE_LEVELS = {
+    'PRICE_LEVEL_FREE': 'Free', 'PRICE_LEVEL_INEXPENSIVE': '+',
+    'PRICE_LEVEL_MODERATE': '++', 'PRICE_LEVEL_EXPENSIVE': '+++',
+    'PRICE_LEVEL_VERY_EXPENSIVE': '++++',
+}
+
+_EN_FR_DAYS = [('Monday', 'lundi'), ('Tuesday', 'mardi'), ('Wednesday', 'mercredi'),
+               ('Thursday', 'jeudi'), ('Friday', 'vendredi'), ('Saturday', 'samedi'),
+               ('Sunday', 'dimanche')]
+
+
+def _closed_days_fr(opening):
+    """Jours de fermeture hebdomadaires, en français, depuis regularOpeningHours.
+    On parse les weekdayDescriptions ('Monday: Closed', langue forcée à 'en'
+    dans la requête) : plus robuste que d'interpréter la convention des
+    periods. Vide si ouvert 7j/7 ou si horaires inconnus."""
+    descs = (opening or {}).get('weekdayDescriptions') or []
+    closed_en = {d.split(':', 1)[0].strip() for d in descs if 'closed' in d.lower()}
+    return ', '.join(fr for en, fr in _EN_FR_DAYS if en in closed_en)
+
+
+def _extract_country(components):
+    """Renvoie (pays_long, code_pays) depuis addressComponents (New API :
+    longText/shortText), ex. ('France', 'FR')."""
+    for comp in (components or []):
         if 'country' in (comp.get('types') or []):
-            return comp.get('long_name'), comp.get('short_name')
+            return comp.get('longText'), comp.get('shortText')
     return None, None
 
 
-def get_place_details(place_id, api_key):
-    details_url = "https://maps.googleapis.com/maps/api/place/details/json"
-    details_params = {
-        'place_id': place_id,
-        'fields': 'name,formatted_address,rating,user_ratings_total,price_level,international_phone_number,website,geometry/location,address_components',
-        'language': 'en',
-        'key': api_key
+def _parse_new_place(pl):
+    """Transforme un objet 'place' de l'API New en dict interne de l'outil.
+    Renvoie None pour les lieux fermés définitivement (ni Excel ni parcours)."""
+    place_id = pl.get('id')
+    if not place_id:
+        return None
+    if pl.get('businessStatus') == 'CLOSED_PERMANENTLY':
+        name = (pl.get('displayName') or {}).get('text', place_id)
+        print(f"   ⏭️ Fermé définitivement, ignoré : {name}")
+        return None
+    loc = pl.get('location') or {}
+    full_address = pl.get('formattedAddress', 'Not specified')
+    country_long, country_short = _extract_country(pl.get('addressComponents'))
+    website = pl.get('websiteUri')
+    return {
+        'City': extract_city_from_address(full_address),
+        'Address': full_address,
+        'Name': (pl.get('displayName') or {}).get('text', 'Not specified'),
+        'Total Reviews': pl.get('userRatingCount', 0),
+        'Rating (on 5)': pl.get('rating', 'Not rated'),
+        'Price Level': _PRICE_LEVELS.get(pl.get('priceLevel'), 'Not specified'),
+        'Maps': f'=HYPERLINK("https://www.google.com/maps/place/?q=place_id:{place_id}", "📍 Google Maps")',
+        'Website': f'=HYPERLINK("{website}", "🌐 Site web")' if website else '',
+        'Phone': pl.get('internationalPhoneNumber', 'Not available'),
+        # Résumé éditorial Google (quand il existe) : donne à l'Excel une vraie
+        # phrase de présentation du lieu, pas juste des chiffres.
+        'Description': (pl.get('editorialSummary') or {}).get('text', ''),
+        # Jours de fermeture hebdo -> colonne Excel + avertissement itinéraire.
+        'Fermeture': _closed_days_fr(pl.get('regularOpeningHours')),
+        'PlaceID': place_id,
+        'Lat': loc.get('latitude'),
+        'Lng': loc.get('longitude'),
+        'Country': country_long,
+        'CountryCode': country_short,
+        'Types': pl.get('types') or [],
+        'PrimaryType': pl.get('primaryType', ''),
+        'BusinessStatus': pl.get('businessStatus', ''),
     }
-    response = requests.get(details_url, params=details_params, timeout=30)
-    if response.status_code == 200:
-        return response.json().get('result', {})
-    print(f"Failed to fetch details for place_id: {place_id}")
-    return None
 
 
 def geocode_location(location, api_key):
@@ -153,59 +217,139 @@ def geocode_location(location, api_key):
 
 
 def search_places(api_key, location, category):
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    params = {'query': f'{category} in {location}', 'language': 'en', 'key': api_key}
-
-    response = requests.get(url, params=params, timeout=30)
+    url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        # Le field mask = la liste des champs facturés ET renvoyés pour CHAQUE
+        # lieu du résultat. Un seul appel remplace 1 search + 20 details legacy.
+        "X-Goog-FieldMask": PLACES_FIELD_MASK,
+    }
+    body = {"textQuery": f"{category} in {location}",
+            "languageCode": "en", "pageSize": 20}
+    try:
+        response = requests.post(url, json=body, headers=headers, timeout=30)
+    except Exception as e:
+        print(f"⚠️ Réseau KO pour {category} : {e}")
+        return []
     if response.status_code != 200:
-        print(f"Erreur {response.status_code} lors de la récupération des données pour {category}")
+        detail = ""
+        try:
+            detail = (response.json().get('error') or {}).get('message', '')
+        except Exception:
+            pass
+        print(f"⚠️ Erreur {response.status_code} pour {category} : {detail}")
+        if response.status_code == 403:
+            print("   💡 Vérifie que 'Places API (New)' est ACTIVÉE dans la console "
+                  "GCP et autorisée sur ta clé (c'est une API distincte du legacy).")
         return []
-    payload = response.json()
-    api_status = payload.get('status', 'UNKNOWN')
-    if api_status not in ('OK', 'ZERO_RESULTS'):
-        print(f"⚠️ API status '{api_status}' pour {category} : {payload.get('error_message', 'pas de détail')}")
-        return []
-    places = payload.get('results', [])[:20]  # top 20 de la 1ère page
+    places = response.json().get('places', [])
+    return [p for p in (_parse_new_place(pl) for pl in places) if p]
 
-    detailed_places = []
-    for place in places:
-        place_id = place.get('place_id')
-        if not place_id:
-            continue
-        # Lieu fermé définitivement : on ne le met nulle part (ni Excel, ni
-        # itinéraire) et on économise l'appel details.
-        if place.get('business_status') == 'CLOSED_PERMANENTLY':
-            print(f"   ⏭️ Fermé définitivement, ignoré : {place.get('name', place_id)}")
-            continue
-        details = get_place_details(place_id, api_key)
-        if details:
-            full_address = details.get('formatted_address', 'Not specified')
-            country_long, country_short = _extract_country(details)
-            detailed_places.append({
-                'City': extract_city_from_address(full_address),
-                'Address': full_address,
-                'Name': details.get('name', 'Not specified'),
-                'Total Reviews': details.get('user_ratings_total', 0),
-                'Rating (on 5)': details.get('rating', 'Not rated'),
-                'Price Level': {0: "Free", 1: "+", 2: "++", 3: "+++", 4: "++++"}.get(
-                    details.get('price_level', None), 'Not specified'),
-                'Maps': f'=HYPERLINK("https://www.google.com/maps/place/?q=place_id:{place_id}", "📍 Google Maps")',
-                'Phone': details.get('international_phone_number', 'Not available'),
-                'PlaceID': place_id,
-                'Lat': (details.get('geometry') or {}).get('location', {}).get('lat'),
-                'Lng': (details.get('geometry') or {}).get('location', {}).get('lng'),
-                'Country': country_long,
-                'CountryCode': country_short,
-                # Classification machine de Google (ex. ['supermarket','store']) :
-                # déjà présente dans la réponse textsearch, GRATUITE, et valable
-                # dans tous les pays. C'est elle qui permet à l'itinéraire de
-                # distinguer un vrai site d'un Super U / camping / pharmacie,
-                # quelle que soit la langue ou l'enseigne locale.
-                'Types': place.get('types') or [],
-                'BusinessStatus': place.get('business_status', ''),
-            })
+
+# ----------------------------------------------------------------------------
+# Enrichissement Wikipédia (GRATUIT, sans clé) - signal de popularité externe
+# ----------------------------------------------------------------------------
+# Idée (validée par la littérature : Oberholzer et al. 2023, les avis Google
+# combinés aux pageviews Wikipédia expliquent le mieux la fréquentation réelle) :
+# un lieu qui a un article Wikipédia consulté est un incontournable ; l'article
+# est trouvé par GÉOLOCALISATION (geosearch autour des coordonnées du lieu) puis
+# validé par similarité de nom -> pas d'homonymes. On enrichit uniquement le
+# top des visites (pas les restos/bars), et le score de l'itinéraire booste
+# les lieux reconnus. Deux APIs Wikimedia, aucune clé, juste un User-Agent poli.
+WIKI_UA = {"User-Agent": "PlaceExplorer/2.0 (https://github.com/romtaug/PlaceExplorer-Claude; romtaug@gmail.com)"}
+WIKI_LANGS = ("fr", "en")          # fr d'abord (destinations francophones), puis en
+
+
+def _wiki_geosearch(lat, lng, lang, radius=400, limit=5):
+    """Titres d'articles Wikipédia géolocalisés à moins de `radius` m du lieu."""
+    r = requests.get(f"https://{lang}.wikipedia.org/w/api.php", params={
+        "action": "query", "list": "geosearch", "gscoord": f"{lat}|{lng}",
+        "gsradius": radius, "gslimit": limit, "format": "json"},
+        headers=WIKI_UA, timeout=15)
+    if r.status_code != 200:
+        return []
+    return [g.get("title", "") for g in
+            (r.json().get("query") or {}).get("geosearch", [])]
+
+
+def _wiki_title_score(name, title):
+    """Similarité nom du lieu <-> titre d'article : part des mots significatifs
+    en commun (accents/casse ignorés, mots-outils retirés). 1.0 = match parfait."""
+    stop = {"de", "du", "des", "la", "le", "les", "l", "d", "et",
+            "of", "the", "a", "an", "and", "in"}
+    a = set(_norm_txt(name).replace("'", " ").replace("-", " ").split()) - stop
+    b = set(_norm_txt(title).replace("'", " ").replace("-", " ").split()) - stop
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def _wiki_monthly_views(lang, title):
+    """Moyenne mensuelle de consultations de l'article sur ~12 derniers mois
+    complets (API REST Wikimedia pageviews)."""
+    end = dt.date.today().replace(day=1) - dt.timedelta(days=1)   # fin du mois dernier
+    start = (end - dt.timedelta(days=330)).replace(day=1)          # ~12 mois plus tôt
+    t = quote(title.replace(" ", "_"), safe="")
+    url = (f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/"
+           f"{lang}.wikipedia/all-access/all-agents/{t}/monthly/"
+           f"{start:%Y%m%d}00/{end:%Y%m%d}00")
+    r = requests.get(url, headers=WIKI_UA, timeout=15)
+    if r.status_code != 200:
+        return 0
+    items = (r.json() or {}).get("items", [])
+    if not items:
+        return 0
+    return round(sum(i.get("views", 0) for i in items) / len(items))
+
+
+def wiki_enrich(place):
+    """Tente de relier UN lieu à son article Wikipédia (fr puis en). Si trouvé,
+    pose WikiTitle / WikiLang / WikiViews / WikiUrl sur le dict (partagé avec
+    l'itinéraire, qui s'en sert pour booster le classement et lier l'article).
+    Renvoie True si un article a été reconnu."""
+    lat, lng = place.get('Lat'), place.get('Lng')
+    if lat is None or lng is None or place.get('WikiTitle'):
+        return bool(place.get('WikiTitle'))
+    for lang in WIKI_LANGS:
+        try:
+            titles = _wiki_geosearch(lat, lng, lang)
+        except Exception:
+            titles = []
+        best, best_score = None, 0.0
+        for t in titles:
+            sc = _wiki_title_score(place.get('Name', ''), t)
+            if sc > best_score:
+                best, best_score = t, sc
+        if best and best_score >= 0.5:      # seuil prudent : pas d'homonyme forcé
+            try:
+                views = _wiki_monthly_views(lang, best)
+            except Exception:
+                views = 0
+            place['WikiTitle'] = best
+            place['WikiLang'] = lang
+            place['WikiViews'] = views
+            place['WikiUrl'] = (f"https://{lang}.wikipedia.org/wiki/"
+                                + quote(best.replace(" ", "_")))
+            return True
         time.sleep(0.05)
-    return detailed_places
+    return False
+
+
+def enrich_with_wikipedia(places_by_category, top_n=40):
+    """Enrichit le top `top_n` des VISITES potentielles (les dicts étant
+    partagés, l'itinéraire voit directement les champs Wiki). Restos et bars
+    ne sont pas concernés : le boost ne s'applique qu'aux lieux à visiter."""
+    from maps_route import _classify, _dedup, _top
+    visits, _, _ = _classify(places_by_category)
+    pool = _top(_dedup(visits), top_n)
+    hits = 0
+    for p in pool:
+        if wiki_enrich(p):
+            hits += 1
+        time.sleep(0.05)                    # politesse API Wikimedia
+    print(f"🔎 Wikipédia : {hits}/{len(pool)} lieux reliés à un article "
+          f"(boost popularité + lien dans le parcours).")
 
 
 # ----------------------------------------------------------------------------
@@ -281,10 +425,11 @@ def style_workbook(file_path):
             for name in ('Rating (on 5)', 'Price Level', 'City'):
                 if name in col_idx:
                     ws.cell(row=r, column=col_idx[name]).alignment = center
-            if 'Maps' in col_idx:
-                c = ws.cell(row=r, column=col_idx['Maps'])
-                c.font = link_font
-                c.alignment = center
+            for name in ('Maps', 'Website', 'Wikipédia'):
+                if name in col_idx:
+                    c = ws.cell(row=r, column=col_idx[name])
+                    c.font = link_font
+                    c.alignment = center
 
         # Volet figé + filtres
         ws.freeze_panes = "A2"
@@ -461,7 +606,8 @@ def create_excel_file(api_key, location, vacation_month):
         description = CATEGORIES[category]
         df = pd.DataFrame(data).sort_values(by='Total Reviews', ascending=False)
         df = df.drop(columns=['PlaceID', 'Lat', 'Lng', '_category',
-                              'Country', 'CountryCode', 'Types', 'BusinessStatus'],
+                              'Country', 'CountryCode', 'Types', 'PrimaryType',
+                              'BusinessStatus'],
                      errors='ignore')
         sheet_name = description if len(description) <= 31 else description[:31]
         df.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -486,6 +632,8 @@ def _write_legend(writer, kind):
             ("Total Reviews", "Nombre d'avis Google = popularité. Colonne en dégradé : plus c'est vert, plus c'est populaire."),
             ("Rating (on 5)", "Note moyenne Google sur 5."),
             ("Maps", "Lien cliquable vers la fiche Google Maps du lieu."),
+            ("Wikipédia", "Article Wikipédia du lieu (quand reconnu automatiquement)."),
+            ("Fermé", "Jour(s) de fermeture hebdomadaire - à vérifier avant d'y aller."),
             ("Parcours (Vue d'ensemble)", "Ouvre TOUT l'itinéraire du jour à pied dans Google Maps."),
         ]
     else:
@@ -495,6 +643,9 @@ def _write_legend(writer, kind):
             ("Rating (on 5)", "Note moyenne Google sur 5."),
             ("Price Level", "Niveau de prix : Free, +, ++, +++, ++++."),
             ("Maps", "Lien cliquable vers la fiche Google Maps du lieu."),
+            ("Website", "Lien cliquable vers le site officiel du lieu (quand renseigné)."),
+            ("Description", "Résumé éditorial Google du lieu (quand disponible)."),
+            ("Fermeture", "Jour(s) de fermeture hebdomadaire du lieu (vide = ouvert 7j/7 ou horaires inconnus)."),
             ("Astuce", "Chaque feuille est triée par popularité : les incontournables sont en haut."),
             ("Astuce", "Un plan multi-jours détaillé peut être généré (champ 'Nombre de jours' au lancement)."),
         ]
@@ -533,6 +684,8 @@ def create_multiday_excel(plan, location, vacation_month, script_dir):
     for d in plan:
         rows = []
         for i, s in enumerate(d["sequence"], start=1):
+            wiki = (f'=HYPERLINK("{s["WikiUrl"]}", "📖 Wikipédia")'
+                    if s.get("WikiUrl") else "")
             rows.append({
                 "Ordre": i,
                 "Étape": s.get("_step", ""),
@@ -541,6 +694,8 @@ def create_multiday_excel(plan, location, vacation_month, script_dir):
                 "Rating (on 5)": s.get("Rating (on 5)", ""),
                 "Total Reviews": s.get("Total Reviews", 0),
                 "Maps": s.get("Maps", ""),
+                "Wikipédia": wiki,
+                "Fermé": s.get("Fermeture", ""),
                 "Address": s.get("Address", ""),
             })
         pd.DataFrame(rows).to_excel(writer, sheet_name=f"Jour {d['day']}", index=False)
@@ -898,6 +1053,15 @@ if __name__ == "__main__":
         city_anchor = geocode_location(location, API_KEY)
         if city_anchor:
             print(f"📍 Ancre itinéraire (ville géocodée) : {city_anchor[0]:.4f}, {city_anchor[1]:.4f}")
+        # Enrichissement Wikipédia (gratuit, sans clé) AVANT la construction du
+        # parcours : les lieux reconnus reçoivent un boost de popularité et un
+        # lien vers leur article. Désactivable avec WIKI_ENRICH=0. Ne doit
+        # JAMAIS faire échouer le run -> tout est enveloppé.
+        if os.environ.get("WIKI_ENRICH", "1") != "0":
+            try:
+                enrich_with_wikipedia(places_by_category)
+            except Exception as e:
+                print(f"⚠️ Enrichissement Wikipédia ignoré : {e}")
         itin = build_day_itinerary(places_by_category, api_key=API_KEY, anchor=city_anchor)
         if itin:
             print("🗺️ Itinéraire du jour :")
