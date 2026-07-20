@@ -3,13 +3,16 @@
 Itinéraire d'UNE JOURNÉE à pied pour PlaceExplorer — un seul lien Google Maps.
 
 Logique :
-  - top des lieux les plus populaires (nb d'avis), HORS restaurants/bars/clubs
-    et hors catégories non-touristiques (aéroports, gares, hôpitaux, écoles,
-    supermarchés, salles de sport) ;
+  - SÉLECTION : uniquement des lieux qui se visitent. Quatre filets : catégorie
+    de recherche, `types` Google (mondial : supermarché, camping, pharmacie...
+    écartés quel que soit le pays ; site touristique taggé = toujours gardé),
+    nom de l'enseigne (filet de secours), et statut (lieux fermés exclus) ;
+  - CLASSEMENT : note bayésienne (qualité) et non volume brut d'avis — un
+    lieu de passage très fréquenté ne bat plus une pépite très bien notée ;
   - ordre optimisé pour minimiser la marche (nearest-neighbor + 2-opt, comme
     thermodata_engine) ;
-  - déjeuner = resto le plus populaire (mi-parcours), dîner = 2e resto le plus
-    populaire (fin), bar/club = le plus populaire (après) ;
+  - déjeuner = meilleur resto (mi-parcours), dîner = 2e meilleur (fin),
+    bar/club = le meilleur (après) ;
   - 1 seul lien Maps (format api=1, travelmode=walking) ;
   - distance + temps de marche RÉELS via la Directions API (1 seul appel).
 
@@ -18,6 +21,8 @@ Nécessite 'Lat'/'Lng'/'PlaceID' sur chaque lieu (cf. intégration).
 
 import math
 import os
+import re
+import unicodedata
 import urllib.parse
 import requests
 
@@ -36,8 +41,120 @@ MAX_KM_FROM_CORE = 30.0
 
 FOOD_CATEGORIES = {"restaurants"}
 BAR_CATEGORIES = {"bars", "nightclubs"}            # bar OU club, le plus populaire
-NON_TOURIST = {"airports", "train_stations", "hospitals",
-               "schools", "supermarkets", "gym"}
+
+# ══ Moteur de sélection de l'itinéraire ══════════════════════════════════════
+# Principe : l'Excel garde TOUT (catalogue), l'itinéraire ne garde que ce qui
+# se VISITE. Quatre filets complémentaires, du plus fiable au plus rustique :
+#   1) la catégorie de recherche (certaines ne se visitent jamais) ;
+#   2) les `types` Google du lieu — classification machine, valable dans tous
+#      les pays et toutes les langues (un supermarché lituanien 'Maxima' est
+#      taggé `supermarket` exactement comme un Super U) ;
+#   3) le nom (filet de secours pour les enseignes mal typées) ;
+#   4) le statut (un lieu fermé ne se recommande pas).
+
+# 1) Catégories jamais mises dans le parcours. NB : 'markets' n'y est PAS —
+#    un vrai marché couvert (Boqueria, Mercatu di L'Isula Rossa) est une vraie
+#    visite ; ce sont les supermarchés parasites que les filets 2-3 éliminent.
+NON_TOURIST_CATS = {"airports", "train_stations", "hospitals", "schools",
+                    "supermarkets", "gym", "campgrounds"}
+
+# 2a) Types qui font FOI : si Google tagge le lieu comme site touristique,
+#     il entre dans le parcours même s'il porte aussi un type exclu (ex. un
+#     château-hôtel = tourist_attraction + lodging -> visite quand même).
+STRONG_TOURIST_TYPES = {
+    "tourist_attraction", "museum", "art_gallery", "place_of_worship",
+    "church", "hindu_temple", "mosque", "synagogue", "park", "national_park",
+    "zoo", "aquarium", "amusement_park", "natural_feature", "stadium",
+    "historical_landmark", "monument", "castle", "beach", "marina",
+    "botanical_garden", "hiking_area", "landmark",
+}
+
+# 2b) Types qui excluent (sauf si un type fort est présent) : le quotidien,
+#     les services, l'hébergement... Mondial par construction.
+EXCLUDE_TYPES = {
+    # commerce du quotidien
+    "supermarket", "grocery_or_supermarket", "convenience_store",
+    "department_store", "shopping_mall", "hardware_store", "home_goods_store",
+    "furniture_store", "electronics_store",
+    # auto & carburant
+    "car_dealer", "car_rental", "car_repair", "car_wash", "gas_station",
+    # hébergement & camping
+    "campground", "rv_park", "lodging",
+    # santé, argent, admin, services
+    "hospital", "doctor", "dentist", "pharmacy", "drugstore",
+    "physiotherapist", "veterinary_care", "bank", "atm", "insurance_agency",
+    "real_estate_agency", "lawyer", "accounting", "post_office", "police",
+    "courthouse", "embassy", "local_government_office", "storage",
+    "moving_company", "funeral_home", "beauty_salon", "hair_care", "laundry",
+    # éducation & sport du quotidien
+    "school", "primary_school", "secondary_school", "university", "gym",
+    # transports
+    "airport", "train_station", "transit_station", "bus_station",
+    "subway_station", "light_rail_station", "taxi_stand", "parking",
+}
+
+# 2c) Re-routage par type : un resto remonté dans une autre catégorie (ex.
+#     'boutiques') part dans le bucket repas, pas dans les visites.
+_FOOD_TYPES = {"restaurant", "cafe", "meal_takeaway"}
+_BAR_TYPES = {"bar", "night_club"}
+
+# 3) Filet par le NOM (enseignes mal typées par Google). Volontairement large
+#    sur l'Europe : FR, DE, ES/PT, IT, BE/NL, CH, UK, LT...
+_NON_TOURIST_NAME = re.compile(
+    r"\bcamping\b|campground|"
+    r"supermarch|supermarket|supermarkt|supermercado|hipermercado|hypermarch|"
+    r"super\s?u\b|hyper\s?u\b|u\s?express|\bspar\b|carrefour|intermarch|"
+    r"e\.?\s?leclerc|\bleclerc\b|\blidl\b|\baldi\b|auchan|monoprix|franprix|"
+    r"\btesco\b|kaufland|\bedeka\b|\brewe\b|\bnetto\b|mercadona|\bcontinente\b|"
+    r"\bmaxima\b|\brimi\b|\bnorfa\b|\biki\b|albert\s?heijn|delhaize|migros|"
+    r"\bconad\b|\bcoop\s?(supermercato|city)\b|esselunga"
+)
+
+
+def _ascii_lower(s):
+    s = unicodedata.normalize("NFD", s or "")
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s.lower()
+
+
+def _is_non_tourist_name(p):
+    return bool(_NON_TOURIST_NAME.search(_ascii_lower(p.get("Name"))))
+
+
+def _is_open(p):
+    """4) Un lieu fermé (définitivement ou temporairement) ne va pas dans le
+    parcours. Champ absent (anciennes données) = considéré ouvert."""
+    return (p.get("BusinessStatus") or "OPERATIONAL") == "OPERATIONAL"
+
+
+def _classify(places_by_category):
+    """Répartit les lieux en (visites, restos, bars) pour l'itinéraire,
+    en appliquant les quatre filets ci-dessus. L'Excel n'est pas concerné."""
+    visits, restos, bars = [], [], []
+    for cat, places in places_by_category.items():
+        for p in places:
+            if not _coords(p) or not _is_open(p):
+                continue
+            if cat in FOOD_CATEGORIES:
+                restos.append(p)
+                continue
+            if cat in BAR_CATEGORIES:
+                bars.append(p)
+                continue
+            if cat in NON_TOURIST_CATS:
+                continue
+            t = set(p.get("Types") or [])
+            if t & STRONG_TOURIST_TYPES:      # un vrai site l'emporte toujours
+                visits.append(p)
+            elif (t & EXCLUDE_TYPES) or _is_non_tourist_name(p):
+                continue                       # quotidien / service / enseigne
+            elif t & _FOOD_TYPES:
+                restos.append(p)               # resto égaré dans une catégorie visite
+            elif t & _BAR_TYPES:
+                bars.append(p)
+            else:
+                visits.append(p)               # neutre : bénéfice du doute
+    return visits, restos, bars
 
 
 # ── Géométrie (reprise de thermodata_engine) ──────────────────────
@@ -100,8 +217,47 @@ def optimize_walking_order(stops, start=0):
 
 
 # ── Sélection ─────────────────────────────────────────────────────
+# Poids du prior bayésien : nombre d'avis "fictifs" à la moyenne locale ajoutés
+# à chaque lieu. Plus c'est haut, plus il faut d'avis pour que la note propre
+# du lieu s'impose. Réglable sans toucher au code.
+BAYES_M = float(os.environ.get("ITINERARY_QUALITY_PRIOR", 300))
+
+
+def _rating(p):
+    r = p.get("Rating (on 5)")
+    try:
+        return float(r)
+    except (TypeError, ValueError):
+        return None                      # 'Not rated' ou absent
+
+
 def _top(places, k=None):
-    r = sorted(places, key=lambda d: d.get("Total Reviews", 0) or 0, reverse=True)
+    """Classement QUALITÉ (note bayésienne façon IMDb), pas volume brut.
+
+    Pourquoi : le nombre d'avis mesure le PASSAGE, pas l'intérêt — un
+    supermarché ou un McDo cumule des milliers d'avis de locaux. La note
+    bayésienne  score = (v·R + m·C) / (v + m)  (v = nb d'avis du lieu,
+    R = sa note, C = note moyenne du pool, m = BAYES_M) fait remonter les
+    pépites très bien notées et retient les gros volumes moyennement notés,
+    tout en restant prudente sur les lieux à 3 avis 5 étoiles.
+    Le prior C est PONDÉRÉ par le volume d'avis : la note moyenne réellement
+    observée sur le terrain, insensible aux micro-échantillons flatteurs.
+    Égalité départagée par le volume d'avis (le plus connu d'abord)."""
+    num = sum((_rating(p) or 0) * (p.get("Total Reviews", 0) or 0)
+              for p in places if _rating(p) is not None)
+    den = sum((p.get("Total Reviews", 0) or 0)
+              for p in places if _rating(p) is not None)
+    prior = (num / den) if den else 4.2
+
+    def score(p):
+        v = p.get("Total Reviews", 0) or 0
+        r = _rating(p)
+        if r is None:
+            r, v = prior, 0
+        return (v * r + BAYES_M * prior) / (v + BAYES_M)
+
+    r = sorted(places, key=lambda p: (score(p), p.get("Total Reviews", 0) or 0),
+               reverse=True)
     return r[:k] if k else r
 
 
@@ -258,19 +414,7 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS,
     le parcours se centre dessus -> fiable même si Google a ramené des lieux
     d'une autre ville. Sinon, on retombe sur la zone la plus dense des résultats.
     """
-    visits, restos, bars = [], [], []
-    for cat, places in places_by_category.items():
-        for p in places:
-            if not _coords(p):
-                continue
-            if cat in FOOD_CATEGORIES:
-                restos.append(p)
-            elif cat in BAR_CATEGORIES:
-                bars.append(p)
-            elif cat in NON_TOURIST:
-                continue
-            else:
-                visits.append(p)
+    visits, restos, bars = _classify(places_by_category)
 
     # Garde-fou : on retire du parcours à pied les lieux trop loin du cœur.
     # L'Excel, lui, garde tout — ce filtre n'agit que sur l'itinéraire.
@@ -324,8 +468,8 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS,
     if len(visits) < 2:
         return None
 
-    start = max(range(len(visits)), key=lambda i: visits[i].get("Total Reviews", 0) or 0)
-    seq = list(optimize_walking_order(visits, start))
+    # `visits` sort de _top déjà trié qualité -> le départ est le meilleur lieu.
+    seq = list(optimize_walking_order(visits, 0))
     for v in seq:
         v["_step"] = "🎯"
 
@@ -417,11 +561,16 @@ def _order_by_proximity(centroids, anchor):
 
 
 def _nearest_unused(places, center, used, k):
-    """k lieux les plus proches du centre du jour, non déjà utilisés (repas/bar)."""
+    """k lieux pour le jour, non déjà utilisés : la QUALITÉ dans la ZONE.
+    On prend d'abord les candidats les plus proches du centre du jour (pool de
+    proximité), puis on garde les MEILLEURS au score bayésien. Le déjeuner du
+    jour 2 est ainsi le meilleur resto de sa zone, pas juste le plus proche
+    (qui peut être un kebab à 3,6 quand un 4,7 est à 200 m de plus)."""
     cand = [p for p in places
             if (p.get("PlaceID") or id(p)) not in used and _coords(p)]
     cand.sort(key=lambda p: hav(center[0], center[1], *_coords(p)))
-    chosen = cand[:k]
+    pool = cand[:max(8, 4 * k)]            # assez proche pour rester "du coin"
+    chosen = _top(pool, k)
     for p in chosen:
         used.add(p.get("PlaceID") or id(p))
     return chosen
@@ -436,19 +585,7 @@ def build_multiday_plan(places_by_category, days, anchor=None,
     if not days or days < 1:
         return []
 
-    visits, restos, bars = [], [], []
-    for cat, places in places_by_category.items():
-        for p in places:
-            if not _coords(p):
-                continue
-            if cat in FOOD_CATEGORIES:
-                restos.append(p)
-            elif cat in BAR_CATEGORIES:
-                bars.append(p)
-            elif cat in NON_TOURIST:
-                continue
-            else:
-                visits.append(p)
+    visits, restos, bars = _classify(places_by_category)
 
     if anchor is None and MAX_KM_FROM_CORE:
         anchor = _densest_anchor(visits, MAX_KM_FROM_CORE)
@@ -481,8 +618,8 @@ def build_multiday_plan(places_by_category, days, anchor=None,
         day_visits = [pool[i] for i in range(len(pool)) if assign[i] == c]
         if not day_visits:
             continue
-        start = max(range(len(day_visits)),
-                    key=lambda i: day_visits[i].get("Total Reviews", 0) or 0)
+        # Départ du jour = meilleur lieu (qualité bayésienne) de la zone.
+        start = day_visits.index(_top(day_visits, 1)[0])
         seq = [dict(v, _step="🎯") for v in optimize_walking_order(day_visits, start)]
         cen = centroids[c]
         d_restos = _nearest_unused(restos, cen, used_resto, 2)
