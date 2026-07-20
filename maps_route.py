@@ -55,11 +55,15 @@ BAR_CATEGORIES = {"bars", "nightclubs"}            # bar OU club, le plus popula
 #   3) le nom (filet de secours pour les enseignes mal typées) ;
 #   4) le statut (un lieu fermé ne se recommande pas).
 
-# 1) Catégories jamais mises dans le parcours. NB : 'markets' n'y est PAS —
-#    un vrai marché couvert (Boqueria, Mercatu di L'Isula Rossa) est une vraie
-#    visite ; ce sont les supermarchés parasites que les filets 2-3 éliminent.
+# 1) Catégories jamais mises dans le parcours (l'Excel les garde toutes).
+#    Transports, quotidien, ET les catégories de SERVICES : un loueur de
+#    vélos ou un cinéma populaire n'est pas une visite. NB : 'markets' n'y
+#    est PAS - un vrai marché couvert (Boqueria) est une vraie visite ; ce
+#    sont les supermarchés parasites que les filets 2-3 éliminent.
 NON_TOURIST_CATS = {"airports", "train_stations", "hospitals", "schools",
-                    "supermarkets", "gym", "campgrounds"}
+                    "supermarkets", "gym", "campgrounds",
+                    "bike_rentals", "sports_centers", "spas",
+                    "movie_theaters", "boutiques"}
 
 # 2a) Types qui font FOI : si Google tagge le lieu comme site touristique,
 #     il entre dans le parcours même s'il porte aussi un type exclu (ex. un
