@@ -132,19 +132,23 @@ _PRICE_LEVELS = {
     'PRICE_LEVEL_VERY_EXPENSIVE': '++++',
 }
 
-_EN_FR_DAYS = [('Monday', 'lundi'), ('Tuesday', 'mardi'), ('Wednesday', 'mercredi'),
-               ('Thursday', 'jeudi'), ('Friday', 'vendredi'), ('Saturday', 'samedi'),
-               ('Sunday', 'dimanche')]
+_EN_FR_DAYS = [('monday', 'lundi'), ('tuesday', 'mardi'), ('wednesday', 'mercredi'),
+               ('thursday', 'jeudi'), ('friday', 'vendredi'), ('saturday', 'samedi'),
+               ('sunday', 'dimanche')]
 
 
 def _closed_days_fr(opening):
     """Jours de fermeture hebdomadaires, en français, depuis regularOpeningHours.
-    On parse les weekdayDescriptions ('Monday: Closed', langue forcée à 'en'
-    dans la requête) : plus robuste que d'interpréter la convention des
-    periods. Vide si ouvert 7j/7 ou si horaires inconnus."""
+    Parse les weekdayDescriptions ('lundi: Fermé' en fr, 'Monday: Closed' en en) :
+    plus robuste que d'interpréter la convention des periods, et bilingue pour
+    survivre à un changement de languageCode. Vide si ouvert 7j/7 ou inconnu."""
     descs = (opening or {}).get('weekdayDescriptions') or []
-    closed_en = {d.split(':', 1)[0].strip() for d in descs if 'closed' in d.lower()}
-    return ', '.join(fr for en, fr in _EN_FR_DAYS if en in closed_en)
+    closed = set()
+    for d in descs:
+        low = _norm_txt(d)
+        if 'closed' in low or 'ferme' in low:
+            closed.add(low.split(':', 1)[0].strip())
+    return ', '.join(fr for en, fr in _EN_FR_DAYS if en in closed or fr in closed)
 
 
 def _extract_country(components):
@@ -226,7 +230,7 @@ def search_places(api_key, location, category):
         "X-Goog-FieldMask": PLACES_FIELD_MASK,
     }
     body = {"textQuery": f"{category} in {location}",
-            "languageCode": "en", "pageSize": 20}
+            "languageCode": "fr", "pageSize": 20}   # noms, adresses, résumés en FR
     try:
         response = requests.post(url, json=body, headers=headers, timeout=30)
     except Exception as e:
@@ -309,8 +313,18 @@ def wiki_enrich(place):
     l'itinéraire, qui s'en sert pour booster le classement et lier l'article).
     Renvoie True si un article a été reconnu."""
     lat, lng = place.get('Lat'), place.get('Lng')
-    if lat is None or lng is None or place.get('WikiTitle'):
-        return bool(place.get('WikiTitle'))
+    if place.get('WikiTitle'):
+        # Titre déjà connu (ex. tag wikipedia d'OpenStreetMap) : il ne manque
+        # que la popularité de l'article.
+        if place.get('WikiViews') is None:
+            try:
+                place['WikiViews'] = _wiki_monthly_views(
+                    place.get('WikiLang', 'fr'), place['WikiTitle'])
+            except Exception:
+                place['WikiViews'] = 0
+        return True
+    if lat is None or lng is None:
+        return False
     for lang in WIKI_LANGS:
         try:
             titles = _wiki_geosearch(lat, lng, lang)
@@ -350,6 +364,83 @@ def enrich_with_wikipedia(places_by_category, top_n=40):
         time.sleep(0.05)                    # politesse API Wikimedia
     print(f"🔎 Wikipédia : {hits}/{len(pool)} lieux reliés à un article "
           f"(boost popularité + lien dans le parcours).")
+
+
+# ----------------------------------------------------------------------------
+# Points de vue OpenStreetMap (GRATUIT, sans clé) - les belvédères que Google
+# type mal ou ignore. Une seule requête Overpass autour de la ville, injectée
+# UNIQUEMENT dans le parcours (l'Excel reste 100% Google). Fail-safe : toute
+# erreur est avalée, OSM_VIEWPOINTS=0 désactive.
+# ----------------------------------------------------------------------------
+def fetch_osm_viewpoints(anchor, radius_km=10, limit=25):
+    lat, lng = anchor
+    query = (f'[out:json][timeout:15];'
+             f'node(around:{int(radius_km * 1000)},{lat},{lng})'
+             f'["tourism"="viewpoint"]["name"];'
+             f'out body {limit};')
+    r = requests.post("https://overpass-api.de/api/interpreter",
+                      data={"data": query}, headers=WIKI_UA, timeout=25)
+    if r.status_code != 200:
+        return []
+    out = []
+    for el in (r.json() or {}).get("elements", []):
+        tags = el.get("tags") or {}
+        name = tags.get("name")
+        if not name or el.get("lat") is None:
+            continue
+        place = {
+            'City': '', 'Address': tags.get('addr:full', ''),
+            'Name': name, 'Total Reviews': 0, 'Rating (on 5)': 'Not rated',
+            'Price Level': 'Free',
+            'Maps': (f'=HYPERLINK("https://www.google.com/maps/search/?api=1'
+                     f'&query={el["lat"]},{el["lon"]}", "📍 Google Maps")'),
+            'Website': '', 'Phone': 'Not available',
+            'Description': 'Point de vue (OpenStreetMap).', 'Fermeture': '',
+            'PlaceID': f'osm_{el.get("id")}',
+            'Lat': el.get('lat'), 'Lng': el.get('lon'),
+            'Country': None, 'CountryCode': None,
+            'Types': ['viewpoint'], 'PrimaryType': 'viewpoint',
+            'BusinessStatus': 'OPERATIONAL',
+        }
+        # Tag wikipedia OSM ('fr:Notre-Dame de la Serra') -> article direct,
+        # wiki_enrich complètera juste les vues mensuelles.
+        wp = tags.get('wikipedia', '')
+        if ':' in wp:
+            lang, title = wp.split(':', 1)
+            if len(lang) == 2 and title:
+                place['WikiLang'], place['WikiTitle'] = lang, title
+                place['WikiUrl'] = (f"https://{lang}.wikipedia.org/wiki/"
+                                    + quote(title.replace(' ', '_')))
+        out.append(place)
+    return out
+
+
+def inject_osm_viewpoints(places_by_category, anchor):
+    """Ajoute les belvédères OSM comme pseudo-catégorie du PARCOURS, en
+    écartant ceux qui doublonnent un lieu Google (à moins de 150 m avec un
+    nom similaire). Les dicts n'entrent pas dans l'Excel (créé avant)."""
+    try:
+        vps = fetch_osm_viewpoints(anchor)
+    except Exception as e:
+        print(f"⚠️ Points de vue OSM ignorés : {e}")
+        return
+    if not vps:
+        return
+    from maps_route import hav
+    existing = [p for pls in places_by_category.values() for p in pls
+                if p.get('Lat') is not None]
+    kept = []
+    for vp in vps:
+        dup = any(hav(vp['Lat'], vp['Lng'], e['Lat'], e['Lng']) <= 150
+                  and _wiki_title_score(vp['Name'], e.get('Name', '')) >= 0.5
+                  for e in existing)
+        if not dup:
+            vp['_category'] = '🔭 Point de vue'
+            kept.append(vp)
+    if kept:
+        places_by_category['viewpoints'] = kept
+        print(f"🔭 OpenStreetMap : {len(kept)} point(s) de vue ajouté(s) au "
+              f"parcours ({len(vps) - len(kept)} doublon(s) écarté(s)).")
 
 
 # ----------------------------------------------------------------------------
@@ -1106,6 +1197,10 @@ if __name__ == "__main__":
         city_anchor = geocode_location(location, API_KEY)
         if city_anchor:
             print(f"📍 Ancre itinéraire (ville géocodée) : {city_anchor[0]:.4f}, {city_anchor[1]:.4f}")
+        # Points de vue OSM injectés AVANT l'enrichissement Wikipédia, pour que
+        # les belvédères profitent aussi du boost. OSM_VIEWPOINTS=0 désactive.
+        if city_anchor and os.environ.get("OSM_VIEWPOINTS", "1") != "0":
+            inject_osm_viewpoints(places_by_category, city_anchor)
         # Enrichissement Wikipédia (gratuit, sans clé) AVANT la construction du
         # parcours : les lieux reconnus reçoivent un boost de popularité et un
         # lien vers leur article. Désactivable avec WIKI_ENRICH=0. Ne doit
