@@ -53,4 +53,10 @@ Le mail part avec l'Excel en pièce jointe, et l'Excel est aussi disponible en *
 - Mêmes liens qu'avant (Skyscanner, Rome2Rio, Airbnb, Booking, Revolut parrainage, BordEuro...)
 
 ## ⏱ Durée et quota
-32 catégories × **1 requête Text Search (New)** ≈ **32 appels API par run** (~1-2 min), soit ~20× moins que l'ancienne version : un usage personnel reste dans le palier gratuit mensuel du SKU. L'enrichissement Wikipédia ajoute ~80 requêtes gratuites (API Wikimedia, sans clé).
+32 catégories × **1 requête Text Search (New)** ≈ **32 appels API par run** (~1-2 min), soit ~20× moins que l'ancienne version : un usage personnel reste dans le palier gratuit mensuel du SKU. Les enrichissements Wikipédia (boost popularité) et OpenStreetMap (points de vue) sont gratuits et sans clé.
+
+## 🧠 Intelligence du parcours
+- Résultats Google en **français** (noms, adresses, descriptions)
+- Sélection : 4 filets anti-parasites (catégorie, types Google, enseignes, statut) - fini les supermarchés et campings dans l'itinéraire
+- Classement : note bayésienne adaptative × popularité Wikipédia, jours de fermeture affichés
+- **Journées calibrées en temps** : durées de visite par type de lieu + marche estimée, budget réglable via `ITINERARY_DAY_MINUTES` (défaut 540 = 9h) ; autres réglages : `ITINERARY_QUALITY_PRIOR`, `ITINERARY_WIKI_BOOST`, `WIKI_ENRICH=0`, `OSM_VIEWPOINTS=0`
