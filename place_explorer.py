@@ -121,9 +121,9 @@ def extract_city_from_address(full_address):
 # ----------------------------------------------------------------------------
 PLACES_FIELD_MASK = ",".join(f"places.{f}" for f in (
     "id", "displayName", "formattedAddress", "addressComponents", "location",
-    "types", "primaryType", "businessStatus", "rating", "userRatingCount",
-    "priceLevel", "internationalPhoneNumber", "websiteUri",
-    "regularOpeningHours", "editorialSummary",
+    "types", "primaryType", "primaryTypeDisplayName", "businessStatus",
+    "rating", "userRatingCount", "priceLevel", "internationalPhoneNumber",
+    "websiteUri", "regularOpeningHours", "editorialSummary",
 ))
 
 _PRICE_LEVELS = {
@@ -160,6 +160,23 @@ def _extract_country(components):
     return None, None
 
 
+def _compose_description(pl):
+    """Description de base, enrichie au maximum SANS appel supplémentaire :
+    drapeau de fermeture temporaire + type de lieu localisé (ex. 'Site
+    historique') + résumé éditorial Google. L'introduction Wikipédia sera
+    fusionnée ensuite (finalize_descriptions) pour les lieux reconnus."""
+    type_label = (pl.get('primaryTypeDisplayName') or {}).get('text', '')
+    editorial = " ".join(((pl.get('editorialSummary') or {}).get('text') or '').split())
+    parts = []
+    if pl.get('businessStatus') == 'CLOSED_TEMPORARILY':
+        parts.append("⚠️ Fermé temporairement")
+    if type_label and _norm_txt(type_label) not in _norm_txt(editorial):
+        parts.append(type_label)
+    if editorial:
+        parts.append(editorial)
+    return " · ".join(parts)
+
+
 def _parse_new_place(pl):
     """Transforme un objet 'place' de l'API New en dict interne de l'outil.
     Renvoie None pour les lieux fermés définitivement (ni Excel ni parcours)."""
@@ -184,11 +201,12 @@ def _parse_new_place(pl):
         'Maps': f'=HYPERLINK("https://www.google.com/maps/place/?q=place_id:{place_id}", "📍 Google Maps")',
         'Website': f'=HYPERLINK("{website}", "🌐 Site web")' if website else '',
         'Phone': pl.get('internationalPhoneNumber', 'Not available'),
-        # Résumé éditorial Google (quand il existe) : donne à l'Excel une vraie
-        # phrase de présentation du lieu, pas juste des chiffres.
-        'Description': (pl.get('editorialSummary') or {}).get('text', ''),
         # Jours de fermeture hebdo -> colonne Excel + avertissement itinéraire.
         'Fermeture': _closed_days_fr(pl.get('regularOpeningHours')),
+        # Description (colonne FINALE de l'Excel), composée par
+        # _compose_description ; l'introduction Wikipédia y est fusionnée
+        # ensuite (finalize_descriptions), AVANT l'écriture de l'Excel.
+        'Description': _compose_description(pl),
         'PlaceID': place_id,
         'Lat': loc.get('latitude'),
         'Lng': loc.get('longitude'),
@@ -297,6 +315,24 @@ def _wiki_title_score(name, title):
     return len(a & b) / min(len(a), len(b))
 
 
+def _wiki_extract(lang, title, max_chars=450):
+    """Introduction de l'article Wikipédia (2-3 phrases, texte brut).
+    C'est le gros de l'enrichissement de la colonne Description : une vraie
+    présentation rédigée du lieu, en français quand l'article fr existe."""
+    r = requests.get(f"https://{lang}.wikipedia.org/w/api.php", params={
+        "action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1,
+        "exsentences": 3, "redirects": 1, "titles": title, "format": "json"},
+        headers=WIKI_UA, timeout=15)
+    if r.status_code != 200:
+        return ""
+    pages = ((r.json().get("query") or {}).get("pages") or {})
+    text = " ".join(next(iter(pages.values()), {}).get("extract", "").split())
+    if len(text) > max_chars:                    # coupe à la fin d'une phrase
+        cut = text[:max_chars].rsplit(". ", 1)[0]
+        text = (cut + "." if cut else text[:max_chars]).strip()
+    return text
+
+
 def _wiki_monthly_views(lang, title):
     """Moyenne mensuelle de consultations de l'article sur ~12 derniers mois
     complets (API REST Wikimedia pageviews)."""
@@ -323,13 +359,19 @@ def wiki_enrich(place):
     lat, lng = place.get('Lat'), place.get('Lng')
     if place.get('WikiTitle'):
         # Titre déjà connu (ex. tag wikipedia d'OpenStreetMap) : il ne manque
-        # que la popularité de l'article.
+        # que la popularité de l'article et son introduction.
         if place.get('WikiViews') is None:
             try:
                 place['WikiViews'] = _wiki_monthly_views(
                     place.get('WikiLang', 'fr'), place['WikiTitle'])
             except Exception:
                 place['WikiViews'] = 0
+        if place.get('WikiExtract') is None:
+            try:
+                place['WikiExtract'] = _wiki_extract(
+                    place.get('WikiLang', 'fr'), place['WikiTitle'])
+            except Exception:
+                place['WikiExtract'] = ''
         return True
     if lat is None or lng is None:
         return False
@@ -353,6 +395,10 @@ def wiki_enrich(place):
             place['WikiViews'] = views
             place['WikiUrl'] = (f"https://{lang}.wikipedia.org/wiki/"
                                 + quote(best.replace(" ", "_")))
+            try:
+                place['WikiExtract'] = _wiki_extract(lang, best)
+            except Exception:
+                place['WikiExtract'] = ''
             return True
         time.sleep(0.05)
     return False
@@ -380,6 +426,39 @@ def enrich_with_wikipedia(places_by_category, top_n=40):
 # UNIQUEMENT dans le parcours (l'Excel reste 100% Google). Fail-safe : toute
 # erreur est avalée, OSM_VIEWPOINTS=0 désactive.
 # ----------------------------------------------------------------------------
+def finalize_descriptions(places_by_category, max_chars=600):
+    """Fusionne l'introduction Wikipédia dans la colonne Description, AVANT
+    l'écriture de l'Excel. Règles : si l'éditorial Google est redondant avec
+    l'extrait (préfixe commun), l'extrait (plus riche) le remplace ; sinon les
+    deux sont enchaînés. Coupé proprement à la fin d'une phrase."""
+    merged = 0
+    for places in places_by_category.values():
+        for p in places:
+            ext = " ".join((p.get('WikiExtract') or '').split())
+            if not ext:
+                continue
+            desc = (p.get('Description') or '').strip()
+            # Redondance : on compare la DERNIÈRE partie de la description
+            # (l'éditorial, après 'type ·') à l'extrait, ponctuation ignorée ;
+            # si l'extrait la contient déjà, il la remplace (préfixes gardés).
+            parts = [x.strip() for x in desc.split('·')] if desc else []
+            tail_n = _norm_txt(parts[-1]).rstrip('. ').strip() if parts else ''
+            if not desc:
+                desc = ext
+            elif tail_n and tail_n[:60] in _norm_txt(ext):
+                prefix = ' · '.join(parts[:-1])
+                desc = (prefix + ' · ' + ext) if prefix else ext
+            else:
+                desc = desc.rstrip('.') + '. ' + ext
+            if len(desc) > max_chars:
+                cut = desc[:max_chars].rsplit('. ', 1)[0]
+                desc = (cut + '.') if cut else desc[:max_chars]
+            p['Description'] = desc
+            merged += 1
+    if merged:
+        print(f"📝 Descriptions enrichies par Wikipédia : {merged} lieu(x).")
+
+
 def fetch_osm_viewpoints(anchor, radius_km=10, limit=25):
     lat, lng = anchor
     query = (f'[out:json][timeout:15];'
@@ -446,6 +525,11 @@ def inject_osm_viewpoints(places_by_category, anchor):
             vp['_category'] = '🔭 Point de vue'
             kept.append(vp)
     if kept:
+        # Les belvédères tagués wikipedia récupèrent vues + extrait
+        # (wiki_enrich, branche 'titre déjà connu') pour profiter du boost.
+        for vp in kept:
+            if vp.get('WikiTitle'):
+                wiki_enrich(vp)
         places_by_category['viewpoints'] = kept
         print(f"🔭 OpenStreetMap : {len(kept)} point(s) de vue ajouté(s) au "
               f"parcours ({len(vps) - len(kept)} doublon(s) écarté(s)).")
@@ -557,6 +641,13 @@ def style_workbook(file_path):
                 for cell in col:
                     cell.alignment = Alignment(horizontal="left", vertical="center",
                                                wrap_text=True)
+                continue
+            if header == 'Description':            # colonne longue finale
+                ws.column_dimensions[letter].width = 70
+                for cell in col:
+                    if cell.row > 1:
+                        cell.alignment = Alignment(horizontal="left",
+                                                   vertical="top", wrap_text=True)
                 continue
             max_length = len(str(header or ""))
             for cell in col:
@@ -672,17 +763,11 @@ CATEGORIES = {
 }
 
 
-def create_excel_file(api_key, location, vacation_month):
-    normalize_location(location)  # validation
+def fetch_all_places(api_key, location):
+    """Récupère tous les lieux par catégorie (1 appel searchText chacune) et
+    applique le filtre pays. Séparé de l'écriture Excel pour que
+    l'enrichissement Wikipédia (extraits de descriptions) passe AVANT."""
     location = " ".join(location.split())
-    vacation_month = " ".join(vacation_month.split()).replace(",", "-").replace(" ", "")
-    sanitized_location = location.replace(",", "-").replace(" ", "")
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    file_name = f"{sanitized_location}_{vacation_month}.xlsx"
-    file_path = os.path.join(script_dir, file_name)
-
-    # 1) Récupération de tous les lieux par catégorie
     places_by_category = {}
     for category, description in CATEGORIES.items():
         print(f"Fetching data for category: {category}")
@@ -692,9 +777,23 @@ def create_excel_file(api_key, location, vacation_month):
             for p in data:
                 p['_category'] = label
             places_by_category[category] = data
+    return filter_by_country(places_by_category, location)
 
-    # 2) Filtre pays robuste (composant API, tolérant à la langue, anti-vidage)
-    places_by_category = filter_by_country(places_by_category, location)
+
+def create_excel_file(api_key, location, vacation_month, places_by_category=None):
+    normalize_location(location)  # validation
+    location = " ".join(location.split())
+    vacation_month = " ".join(vacation_month.split()).replace(",", "-").replace(" ", "")
+    sanitized_location = location.replace(",", "-").replace(" ", "")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    file_name = f"{sanitized_location}_{vacation_month}.xlsx"
+    file_path = os.path.join(script_dir, file_name)
+
+    # 1) + 2) Lieux déjà fournis (flux principal : fetch -> wiki -> Excel),
+    # sinon récupération ici (compatibilité).
+    if places_by_category is None:
+        places_by_category = fetch_all_places(api_key, location)
 
     # 3) Écriture Excel (colonnes techniques retirées, classeur inchangé)
     writer = pd.ExcelWriter(file_path, engine='openpyxl')
@@ -706,7 +805,8 @@ def create_excel_file(api_key, location, vacation_month):
         df = pd.DataFrame(data).sort_values(by='Total Reviews', ascending=False)
         df = df.drop(columns=['PlaceID', 'Lat', 'Lng', '_category',
                               'Country', 'CountryCode', 'Types', 'PrimaryType',
-                              'BusinessStatus'],
+                              'BusinessStatus', 'WikiTitle', 'WikiLang',
+                              'WikiViews', 'WikiUrl', 'WikiExtract'],
                      errors='ignore')
         sheet_name = description if len(description) <= 31 else description[:31]
         df.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -743,8 +843,8 @@ def _write_legend(writer, kind):
             ("Price Level", "Niveau de prix : Free, +, ++, +++, ++++."),
             ("Maps", "Lien cliquable vers la fiche Google Maps du lieu."),
             ("Website", "Lien cliquable vers le site officiel du lieu (quand renseigné)."),
-            ("Description", "Résumé éditorial Google du lieu (quand disponible)."),
             ("Fermeture", "Jour(s) de fermeture hebdomadaire du lieu (vide = ouvert 7j/7 ou horaires inconnus)."),
+            ("Description", "Dernière colonne : résumé éditorial Google, enrichi par l'introduction Wikipédia quand l'article du lieu est reconnu ; à défaut, le type du lieu."),
             ("Astuce", "Chaque feuille est triée par popularité : les incontournables sont en haut."),
             ("Astuce", "Un plan multi-jours détaillé peut être généré (champ 'Nombre de jours' au lancement)."),
         ]
@@ -796,6 +896,7 @@ def create_multiday_excel(plan, location, vacation_month, script_dir):
                 "Wikipédia": wiki,
                 "Fermé": s.get("Fermeture", ""),
                 "Address": s.get("Address", ""),
+                "Description": s.get("Description", ""),
             })
         pd.DataFrame(rows).to_excel(writer, sheet_name=f"Jour {d['day']}", index=False)
     writer.close()
@@ -1152,7 +1253,19 @@ def send_email_with_excel(sender_email, password, receiver_emails, subject,
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
-        excel_file, location, vacation_month, places_by_category = create_excel_file(API_KEY, LOCATION, VACATION_MONTH)
+        # 1) Récupération des lieux (Places New, 1 appel/catégorie)
+        places_by_category = fetch_all_places(API_KEY, LOCATION)
+        # 2) Wikipédia AVANT l'Excel : articles + extraits d'introduction,
+        #    fusionnés dans la colonne Description. WIKI_ENRICH=0 désactive.
+        if os.environ.get("WIKI_ENRICH", "1") != "0":
+            try:
+                enrich_with_wikipedia(places_by_category)
+                finalize_descriptions(places_by_category)
+            except Exception as e:
+                print(f"⚠️ Enrichissement Wikipédia ignoré : {e}")
+        # 3) Écriture + style de l'Excel
+        excel_file, location, vacation_month, places_by_category = create_excel_file(
+            API_KEY, LOCATION, VACATION_MONTH, places_by_category=places_by_category)
         style_workbook(excel_file)
     except SystemExit:
         raise
@@ -1205,19 +1318,16 @@ if __name__ == "__main__":
         city_anchor = geocode_location(location, API_KEY)
         if city_anchor:
             print(f"📍 Ancre itinéraire (ville géocodée) : {city_anchor[0]:.4f}, {city_anchor[1]:.4f}")
-        # Points de vue OSM injectés AVANT l'enrichissement Wikipédia, pour que
-        # les belvédères profitent aussi du boost. OSM_VIEWPOINTS=0 désactive.
+        # Points de vue OSM injectés APRÈS l'Excel (parcours uniquement) ; ils
+        # récupèrent leurs vues/extraits Wikipédia à la volée via wiki_enrich.
         if city_anchor and os.environ.get("OSM_VIEWPOINTS", "1") != "0":
             inject_osm_viewpoints(places_by_category, city_anchor)
-        # Enrichissement Wikipédia (gratuit, sans clé) AVANT la construction du
-        # parcours : les lieux reconnus reçoivent un boost de popularité et un
-        # lien vers leur article. Désactivable avec WIKI_ENRICH=0. Ne doit
-        # JAMAIS faire échouer le run -> tout est enveloppé.
-        if os.environ.get("WIKI_ENRICH", "1") != "0":
-            try:
-                enrich_with_wikipedia(places_by_category)
-            except Exception as e:
-                print(f"⚠️ Enrichissement Wikipédia ignoré : {e}")
+            if os.environ.get("WIKI_ENRICH", "1") != "0":
+                for _vp in places_by_category.get('viewpoints', []):
+                    try:
+                        wiki_enrich(_vp)
+                    except Exception:
+                        pass
         itin = build_day_itinerary(places_by_category, api_key=API_KEY, anchor=city_anchor)
         if itin:
             print("🗺️ Itinéraire du jour :")
