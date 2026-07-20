@@ -4,8 +4,8 @@ PlaceExplorer - version GitHub Actions
 - Lit la localisation et le mois depuis les variables d'environnement (inputs du workflow)
 - Google Places API (New) : 1 seul appel searchText par catégorie (32 catégories,
   top 20 lieux avec note, avis, prix, horaires, site web, résumé éditorial)
-- Enrichissement Wikipédia gratuit (article + consultations mensuelles) pour
-  booster les incontournables dans l'itinéraire
+- Enrichissement Wikipédia gratuit : introduction de l'article fusionnée dans
+  la colonne Description + lien Wikipédia sur les étapes du parcours
 - Génère l'Excel multi-feuilles et envoie un email HTML stylé depuis
   romtaug@gmail.com avec l'Excel (+ images si présentes) en pièce jointe
 
@@ -21,7 +21,6 @@ import time
 import shutil
 import smtplib
 import unicodedata
-import datetime as dt
 from urllib.parse import quote
 
 import requests
@@ -303,16 +302,24 @@ def _wiki_geosearch(lat, lng, lang, radius=400, limit=5):
             (r.json().get("query") or {}).get("geosearch", [])]
 
 
+WIKI_MATCH_MIN = 0.6      # seuil de similarité nom <-> titre d'article
+
+
 def _wiki_title_score(name, title):
-    """Similarité nom du lieu <-> titre d'article : part des mots significatifs
-    en commun (accents/casse ignorés, mots-outils retirés). 1.0 = match parfait."""
+    """Similarité nom du lieu <-> titre d'article : indice de Jaccard sur les
+    mots significatifs (accents/casse ignorés, mots-outils retirés, mention
+    entre parenthèses du titre ignorée - ex. 'Parc de Saleccia (Île-Rousse)').
+    Le Jaccard (intersection/UNION) punit les mots divergents : 'Plage de
+    Sainte Restitude' vs 'Gare de Sainte-Restitude' tombe à 0.5 (< seuil),
+    là où l'ancien ratio sur le min validait à tort ce faux ami."""
     stop = {"de", "du", "des", "la", "le", "les", "l", "d", "et",
             "of", "the", "a", "an", "and", "in"}
+    title = title.split("(")[0]
     a = set(_norm_txt(name).replace("'", " ").replace("-", " ").split()) - stop
     b = set(_norm_txt(title).replace("'", " ").replace("-", " ").split()) - stop
     if not a or not b:
         return 0.0
-    return len(a & b) / min(len(a), len(b))
+    return len(a & b) / len(a | b)
 
 
 def _wiki_extract(lang, title, max_chars=450):
@@ -333,39 +340,15 @@ def _wiki_extract(lang, title, max_chars=450):
     return text
 
 
-def _wiki_monthly_views(lang, title):
-    """Moyenne mensuelle de consultations de l'article sur ~12 derniers mois
-    complets (API REST Wikimedia pageviews)."""
-    end = dt.date.today().replace(day=1) - dt.timedelta(days=1)   # fin du mois dernier
-    start = (end - dt.timedelta(days=330)).replace(day=1)          # ~12 mois plus tôt
-    t = quote(title.replace(" ", "_"), safe="")
-    url = (f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/"
-           f"{lang}.wikipedia/all-access/all-agents/{t}/monthly/"
-           f"{start:%Y%m%d}00/{end:%Y%m%d}00")
-    r = requests.get(url, headers=WIKI_UA, timeout=15)
-    if r.status_code != 200:
-        return 0
-    items = (r.json() or {}).get("items", [])
-    if not items:
-        return 0
-    return round(sum(i.get("views", 0) for i in items) / len(items))
-
-
 def wiki_enrich(place):
     """Tente de relier UN lieu à son article Wikipédia (fr puis en). Si trouvé,
-    pose WikiTitle / WikiLang / WikiViews / WikiUrl sur le dict (partagé avec
-    l'itinéraire, qui s'en sert pour booster le classement et lier l'article).
-    Renvoie True si un article a été reconnu."""
+    pose WikiTitle / WikiLang / WikiUrl / WikiExtract sur le dict (partagé
+    avec l'itinéraire). Sert aux DESCRIPTIONS de l'Excel et aux liens
+    Wikipédia du parcours - plus au classement. True si article reconnu."""
     lat, lng = place.get('Lat'), place.get('Lng')
     if place.get('WikiTitle'):
         # Titre déjà connu (ex. tag wikipedia d'OpenStreetMap) : il ne manque
-        # que la popularité de l'article et son introduction.
-        if place.get('WikiViews') is None:
-            try:
-                place['WikiViews'] = _wiki_monthly_views(
-                    place.get('WikiLang', 'fr'), place['WikiTitle'])
-            except Exception:
-                place['WikiViews'] = 0
+        # que l'extrait d'introduction pour la Description.
         if place.get('WikiExtract') is None:
             try:
                 place['WikiExtract'] = _wiki_extract(
@@ -385,14 +368,9 @@ def wiki_enrich(place):
             sc = _wiki_title_score(place.get('Name', ''), t)
             if sc > best_score:
                 best, best_score = t, sc
-        if best and best_score >= 0.5:      # seuil prudent : pas d'homonyme forcé
-            try:
-                views = _wiki_monthly_views(lang, best)
-            except Exception:
-                views = 0
+        if best and best_score >= WIKI_MATCH_MIN:   # pas d'homonyme forcé
             place['WikiTitle'] = best
             place['WikiLang'] = lang
-            place['WikiViews'] = views
             place['WikiUrl'] = (f"https://{lang}.wikipedia.org/wiki/"
                                 + quote(best.replace(" ", "_")))
             try:
@@ -404,20 +382,29 @@ def wiki_enrich(place):
     return False
 
 
+def _wiki_pool(visits, top_n=40):
+    """Candidats à l'enrichissement Wikipédia : le top popularité (nb d'avis),
+    c'est-à-dire exactement les lieux susceptibles d'entrer dans le parcours.
+    L'enrichissement ne sert plus au classement : uniquement aux DESCRIPTIONS
+    de l'Excel et aux liens Wikipédia du parcours."""
+    from maps_route import _top, _dedup
+    return _top(_dedup(visits), top_n)
+
+
 def enrich_with_wikipedia(places_by_category, top_n=40):
-    """Enrichit le top `top_n` des VISITES potentielles (les dicts étant
-    partagés, l'itinéraire voit directement les champs Wiki). Restos et bars
+    """Enrichit les VISITES potentielles (les dicts étant partagés,
+    l'itinéraire voit directement les champs Wiki). Restos et bars
     ne sont pas concernés : le boost ne s'applique qu'aux lieux à visiter."""
-    from maps_route import _classify, _dedup, _top
+    from maps_route import _classify
     visits, _, _ = _classify(places_by_category)
-    pool = _top(_dedup(visits), top_n)
+    pool = _wiki_pool(visits, top_n)
     hits = 0
     for p in pool:
         if wiki_enrich(p):
             hits += 1
         time.sleep(0.05)                    # politesse API Wikimedia
     print(f"🔎 Wikipédia : {hits}/{len(pool)} lieux reliés à un article "
-          f"(boost popularité + lien dans le parcours).")
+          f"(description enrichie + lien dans le parcours).")
 
 
 # ----------------------------------------------------------------------------
@@ -519,7 +506,7 @@ def inject_osm_viewpoints(places_by_category, anchor):
     kept = []
     for vp in vps:
         dup = any(hav(vp['Lat'], vp['Lng'], e['Lat'], e['Lng']) <= 150
-                  and _wiki_title_score(vp['Name'], e.get('Name', '')) >= 0.5
+                  and _wiki_title_score(vp['Name'], e.get('Name', '')) >= WIKI_MATCH_MIN
                   for e in existing)
         if not dup:
             vp['_category'] = '🔭 Point de vue'
@@ -806,7 +793,7 @@ def create_excel_file(api_key, location, vacation_month, places_by_category=None
         df = df.drop(columns=['PlaceID', 'Lat', 'Lng', '_category',
                               'Country', 'CountryCode', 'Types', 'PrimaryType',
                               'BusinessStatus', 'WikiTitle', 'WikiLang',
-                              'WikiViews', 'WikiUrl', 'WikiExtract'],
+                              'WikiUrl', 'WikiExtract'],
                      errors='ignore')
         sheet_name = description if len(description) <= 31 else description[:31]
         df.to_excel(writer, sheet_name=sheet_name, index=False)
