@@ -60,5 +60,5 @@ Le mail part avec l'Excel en pièce jointe, et l'Excel est aussi disponible en *
 ## 🧠 Intelligence du parcours
 - Résultats Google en **français** (noms, adresses, descriptions)
 - Sélection : 4 filets anti-parasites (catégorie, types Google, enseignes, statut) - fini les supermarchés et campings dans l'itinéraire
-- Classement : note bayésienne adaptative × popularité Wikipédia, jours de fermeture affichés
-- **Journées calibrées en temps** : durées de visite par type de lieu + marche estimée, budget réglable via `ITINERARY_DAY_MINUTES` (défaut 540 = 9h) ; autres réglages : `ITINERARY_QUALITY_PRIOR`, `ITINERARY_WIKI_BOOST`, `WIKI_ENRICH=0`, `OSM_VIEWPOINTS=0`
+- Classement : popularité pure (nombre d'avis Google), jours de fermeture affichés
+- **Journées calibrées en temps** : durées de visite par type de lieu + marche estimée, budget réglable via `ITINERARY_DAY_MINUTES` (défaut 540 = 9h) ; autres réglages : `WIKI_ENRICH=0`, `OSM_VIEWPOINTS=0`
