@@ -72,7 +72,7 @@ STRONG_TOURIST_TYPES = {
     "stadium", "historical_landmark", "cultural_landmark", "historical_place",
     "monument", "sculpture", "castle", "beach", "marina", "plaza",
     "botanical_garden", "garden", "hiking_area", "landmark",
-    "observation_deck", "performing_arts_theater", "opera_house",
+    "observation_deck", "viewpoint", "performing_arts_theater", "opera_house",
     "amphitheatre",
 }
 
@@ -243,7 +243,7 @@ def optimize_walking_order(stops, start=0):
 # Poids du prior bayésien : nombre d'avis "fictifs" à la moyenne locale ajoutés
 # à chaque lieu. Plus c'est haut, plus il faut d'avis pour que la note propre
 # du lieu s'impose. Réglable sans toucher au code.
-BAYES_M = float(os.environ.get("ITINERARY_QUALITY_PRIOR", 300))
+BAYES_M_ENV = os.environ.get("ITINERARY_QUALITY_PRIOR")   # vide = adaptatif
 # Poids du boost Wikipédia : un lieu relié à un article consulté est un
 # incontournable. facteur = (1 + log10(1 + vues_mensuelles)) ** ALPHA.
 # 0 = désactivé. Ne s'applique qu'aux lieux enrichis (visites, jamais restos).
@@ -256,6 +256,21 @@ def _rating(p):
         return float(r)
     except (TypeError, ValueError):
         return None                      # 'Not rated' ou absent
+
+
+def _bayes_m(places):
+    """Poids m du prior : ADAPTATIF par défaut = médiane du volume d'avis du
+    pool (bornée 50-400). Un m fixe élevé écrase les pépites des petites
+    villes ; la médiane locale calibre automatiquement la confiance selon la
+    densité d'avis de la destination. ITINERARY_QUALITY_PRIOR force une valeur."""
+    if BAYES_M_ENV:
+        return float(BAYES_M_ENV)
+    counts = sorted((p.get("Total Reviews", 0) or 0) for p in places
+                    if (p.get("Total Reviews", 0) or 0) > 0)
+    if not counts:
+        return 100.0
+    med = counts[len(counts) // 2]
+    return float(min(400, max(50, med)))
 
 
 def _top(places, k=None):
@@ -279,13 +294,14 @@ def _top(places, k=None):
     den = sum((p.get("Total Reviews", 0) or 0)
               for p in places if _rating(p) is not None)
     prior = (num / den) if den else 4.2
+    m = _bayes_m(places)
 
     def score(p):
         v = p.get("Total Reviews", 0) or 0
         r = _rating(p)
         if r is None:
             r, v = prior, 0
-        base = (v * r + BAYES_M * prior) / (v + BAYES_M)
+        base = (v * r + m * prior) / (v + m)
         if WIKI_ALPHA and p.get("WikiTitle"):
             views = p.get("WikiViews") or 0
             base *= (1.0 + math.log10(1 + views)) ** WIKI_ALPHA
@@ -294,6 +310,58 @@ def _top(places, k=None):
     r = sorted(places, key=lambda p: (score(p), p.get("Total Reviews", 0) or 0),
                reverse=True)
     return r[:k] if k else r
+
+
+# ── Budget-temps de la journée (philosophie "orienteering", version KISS) ──
+# Une journée de 10 musées n'est pas une journée de 10 belvédères. Au lieu d'un
+# nombre de visites FIXE, on remplit un budget de temps : durée typique par
+# type de lieu + marche estimée (distance 2-opt x détour / vitesse piéton).
+# ITINERARY_DAY_MINUTES règle le budget (défaut 540 = 9h) ; 0 = désactivé
+# (retour au comportement "n visites fixes").
+DAY_BUDGET_MIN = float(os.environ.get("ITINERARY_DAY_MINUTES", 540))
+_WALK_KMH, _DETOUR = 4.5, 1.3          # vitesse piéton, facteur détour rues
+
+_VISIT_MINUTES = [
+    # (types, minutes) - premier match gagne, du plus long au plus court
+    ({"museum", "art_gallery", "aquarium", "zoo", "amusement_park",
+      "national_park", "state_park"}, 120),
+    ({"park", "garden", "botanical_garden", "beach", "hiking_area"}, 75),
+    ({"castle", "historical_landmark", "cultural_landmark", "church",
+      "place_of_worship", "hindu_temple", "mosque", "synagogue", "stadium",
+      "historical_place"}, 45),
+    ({"plaza", "sculpture", "monument", "viewpoint", "observation_deck",
+      "marina", "natural_feature"}, 25),
+]
+
+
+def _visit_minutes(p):
+    t = set(p.get("Types") or [])
+    if p.get("PrimaryType"):
+        t.add(p["PrimaryType"])
+    for types, minutes in _VISIT_MINUTES:
+        if t & types:
+            return minutes
+    return 40                            # tourist_attraction générique, inconnu
+
+
+def _fit_time_budget(scored_visits, cap, budget_min):
+    """Prend les visites TRIÉES PAR SCORE et renvoie (ordre_de_marche,
+    minutes_de_visites, minutes_de_marche) pour la plus grande sélection
+    top-k (k <= cap) qui tient dans le budget. Glouton par la qualité :
+    exactement l'heuristique recommandée face au problème d'orienteering,
+    sans solveur. Plancher à 3 visites pour ne jamais rendre un parcours vide."""
+    n = min(cap, len(scored_visits))
+    for k in range(n, 2, -1):
+        subset = scored_visits[:k]
+        order = optimize_walking_order(subset, 0)
+        walk_min = _route_len(order) / 1000.0 / _WALK_KMH * 60.0 * _DETOUR
+        visit_min = sum(_visit_minutes(p) for p in order)
+        if walk_min + visit_min <= budget_min:
+            return order, visit_min, walk_min
+    subset = scored_visits[:min(3, len(scored_visits))]
+    order = optimize_walking_order(subset, 0)
+    walk_min = _route_len(order) / 1000.0 / _WALK_KMH * 60.0 * _DETOUR
+    return order, sum(_visit_minutes(p) for p in order), walk_min
 
 
 def _dedup(places):
@@ -499,12 +567,19 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS,
     restos = [r for r in restos if r.get("PlaceID") not in vids]
     bars = [b for b in bars if b.get("PlaceID") not in vids]
 
-    visits = _top(visits, n_visits)
+    visits = _top(visits)
     if len(visits) < 2:
         return None
 
-    # `visits` sort de _top déjà trié qualité -> le départ est le meilleur lieu.
-    seq = list(optimize_walking_order(visits, 0))
+    # `visits` sort de _top déjà trié qualité. Sélection par BUDGET-TEMPS :
+    # autant de visites du haut du classement que la journée peut en contenir
+    # (durées par type + marche estimée), plafonné à n_visits.
+    visit_min = walk_est = 0
+    if DAY_BUDGET_MIN > 0:
+        seq, visit_min, walk_est = _fit_time_budget(visits, n_visits, DAY_BUDGET_MIN)
+        seq = list(seq)
+    else:
+        seq = list(optimize_walking_order(visits[:n_visits], 0))
     for v in seq:
         v["_step"] = "🎯"
 
@@ -533,6 +608,7 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS,
         "duration_s": dur,
         "distance_txt": _fmt_dist(dist),
         "duration_txt": _fmt_dur(dur),
+        "visit_minutes": round(visit_min),   # temps de visite estimé (types)
         "has_map": False,   # passe à True quand la carte statique est téléchargée
     }
 
@@ -653,9 +729,14 @@ def build_multiday_plan(places_by_category, days, anchor=None,
         day_visits = [pool[i] for i in range(len(pool)) if assign[i] == c]
         if not day_visits:
             continue
-        # Départ du jour = meilleur lieu (qualité bayésienne) de la zone.
-        start = day_visits.index(_top(day_visits, 1)[0])
-        seq = [dict(v, _step="🎯") for v in optimize_walking_order(day_visits, start)]
+        # Départ du jour = meilleur lieu (qualité) de la zone, puis budget-temps :
+        # on trie la zone par score et on garde ce qui tient dans la journée.
+        ranked = _top(day_visits)
+        if DAY_BUDGET_MIN > 0:
+            ordered, _vm, _wm = _fit_time_budget(ranked, n_visits, DAY_BUDGET_MIN)
+        else:
+            ordered = optimize_walking_order(ranked, 0)
+        seq = [dict(v, _step="🎯") for v in ordered]
         cen = centroids[c]
         d_restos = _nearest_unused(restos, cen, used_resto, 2)
         d_bar = _nearest_unused(bars, cen, used_bar, 1)
@@ -837,6 +918,8 @@ def itinerary_plain_block(itin):
         infos.append(itin["distance_txt"])
     if itin.get("duration_txt"):
         infos.append(f"{itin['duration_txt']}")
+    if itin.get("visit_minutes"):
+        infos.append(f"~{_fmt_dur(itin['visit_minutes'] * 60)} de visites")
     if infos:
         lines.append("    " + " · ".join(infos))
         lines.append("")
@@ -902,6 +985,8 @@ def itinerary_email_block(itin):
         infos.append(f"📏 {itin['distance_txt']}")
     if itin.get("duration_txt"):
         infos.append(f"⏱️ {itin['duration_txt']}")
+    if itin.get("visit_minutes"):
+        infos.append(f"🎟️ ~{_fmt_dur(itin['visit_minutes'] * 60)} de visites")
     info_line = ("&nbsp;&middot;&nbsp;".join(infos)) or "Parcours optimisé"
     map_img = ""
     if itin.get("has_map"):
