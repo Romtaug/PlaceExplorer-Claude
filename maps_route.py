@@ -4,11 +4,14 @@ Itinéraire d'UNE JOURNÉE à pied pour PlaceExplorer — un seul lien Google Ma
 
 Logique :
   - SÉLECTION : uniquement des lieux qui se visitent. Quatre filets : catégorie
-    de recherche, `types` Google (mondial : supermarché, camping, pharmacie...
-    écartés quel que soit le pays ; site touristique taggé = toujours gardé),
-    nom de l'enseigne (filet de secours), et statut (lieux fermés exclus) ;
-  - CLASSEMENT : note bayésienne (qualité) et non volume brut d'avis — un
-    lieu de passage très fréquenté ne bat plus une pépite très bien notée ;
+    de recherche, `types` Google legacy + granulaires API New (supermarché,
+    hôtel, camping, pharmacie... écartés quel que soit le pays ; site
+    touristique taggé = toujours gardé, primaryType inclus), nom de l'enseigne
+    (filet de secours), et statut (lieux fermés exclus) ;
+  - CLASSEMENT : note bayésienne (qualité) x boost Wikipédia (popularité
+    réelle, vues mensuelles de l'article) - un lieu de passage très fréquenté
+    ne bat plus une pépite, et les incontournables reconnus passent devant ;
+  - AVERTISSEMENTS : jours de fermeture hebdo affichés sur chaque étape ;
   - ordre optimisé pour minimiser la marche (nearest-neighbor + 2-opt, comme
     thermodata_engine) ;
   - déjeuner = meilleur resto (mi-parcours), dîner = 2e meilleur (fin),
@@ -61,25 +64,35 @@ NON_TOURIST_CATS = {"airports", "train_stations", "hospitals", "schools",
 # 2a) Types qui font FOI : si Google tagge le lieu comme site touristique,
 #     il entre dans le parcours même s'il porte aussi un type exclu (ex. un
 #     château-hôtel = tourist_attraction + lodging -> visite quand même).
+#     Couvre les types legacy ET les nouveaux types granulaires de l'API New.
 STRONG_TOURIST_TYPES = {
     "tourist_attraction", "museum", "art_gallery", "place_of_worship",
     "church", "hindu_temple", "mosque", "synagogue", "park", "national_park",
-    "zoo", "aquarium", "amusement_park", "natural_feature", "stadium",
-    "historical_landmark", "monument", "castle", "beach", "marina",
-    "botanical_garden", "hiking_area", "landmark",
+    "state_park", "zoo", "aquarium", "amusement_park", "natural_feature",
+    "stadium", "historical_landmark", "cultural_landmark", "historical_place",
+    "monument", "sculpture", "castle", "beach", "marina", "plaza",
+    "botanical_garden", "garden", "hiking_area", "landmark",
+    "observation_deck", "performing_arts_theater", "opera_house",
+    "amphitheatre",
 }
 
 # 2b) Types qui excluent (sauf si un type fort est présent) : le quotidien,
-#     les services, l'hébergement... Mondial par construction.
+#     les services, l'hébergement... Mondial par construction. Inclut les
+#     nouveaux types d'hébergement granulaires de l'API New.
 EXCLUDE_TYPES = {
     # commerce du quotidien
-    "supermarket", "grocery_or_supermarket", "convenience_store",
-    "department_store", "shopping_mall", "hardware_store", "home_goods_store",
-    "furniture_store", "electronics_store",
+    "supermarket", "grocery_or_supermarket", "grocery_store",
+    "convenience_store", "department_store", "shopping_mall",
+    "hardware_store", "home_goods_store", "furniture_store",
+    "electronics_store",
     # auto & carburant
     "car_dealer", "car_rental", "car_repair", "car_wash", "gas_station",
-    # hébergement & camping
-    "campground", "rv_park", "lodging",
+    "electric_vehicle_charging_station",
+    # hébergement & camping (legacy + granulaire New)
+    "campground", "rv_park", "lodging", "hotel", "motel", "resort_hotel",
+    "extended_stay_hotel", "bed_and_breakfast", "guest_house", "hostel",
+    "farmstay", "cottage", "private_guest_room", "inn", "japanese_inn",
+    "budget_japanese_inn", "camping_cabin", "mobile_home_park",
     # santé, argent, admin, services
     "hospital", "doctor", "dentist", "pharmacy", "drugstore",
     "physiotherapist", "veterinary_care", "bank", "atm", "insurance_agency",
@@ -88,15 +101,23 @@ EXCLUDE_TYPES = {
     "moving_company", "funeral_home", "beauty_salon", "hair_care", "laundry",
     # éducation & sport du quotidien
     "school", "primary_school", "secondary_school", "university", "gym",
+    "fitness_center",
     # transports
     "airport", "train_station", "transit_station", "bus_station",
     "subway_station", "light_rail_station", "taxi_stand", "parking",
 }
 
-# 2c) Re-routage par type : un resto remonté dans une autre catégorie (ex.
-#     'boutiques') part dans le bucket repas, pas dans les visites.
-_FOOD_TYPES = {"restaurant", "cafe", "meal_takeaway"}
-_BAR_TYPES = {"bar", "night_club"}
+# 2c) Re-routage par type : un resto/café remonté dans une autre catégorie
+#     (ex. 'boutiques') part dans le bucket repas, pas dans les visites.
+#     La règle suffixe attrape les dizaines de types New '*_restaurant'
+#     (pizza_restaurant, seafood_restaurant, fast_food_restaurant...).
+_FOOD_TYPES = {"restaurant", "cafe", "coffee_shop", "cafeteria", "bakery",
+               "meal_takeaway", "meal_delivery", "sandwich_shop"}
+_BAR_TYPES = {"bar", "night_club", "pub", "wine_bar"}
+
+
+def _is_food_type(t):
+    return bool(t & _FOOD_TYPES) or any(x.endswith("_restaurant") for x in t)
 
 # 3) Filet par le NOM (enseignes mal typées par Google). Volontairement large
 #    sur l'Europe : FR, DE, ES/PT, IT, BE/NL, CH, UK, LT...
@@ -144,11 +165,13 @@ def _classify(places_by_category):
             if cat in NON_TOURIST_CATS:
                 continue
             t = set(p.get("Types") or [])
+            if p.get("PrimaryType"):
+                t.add(p["PrimaryType"])       # le type dominant compte aussi
             if t & STRONG_TOURIST_TYPES:      # un vrai site l'emporte toujours
                 visits.append(p)
             elif (t & EXCLUDE_TYPES) or _is_non_tourist_name(p):
                 continue                       # quotidien / service / enseigne
-            elif t & _FOOD_TYPES:
+            elif _is_food_type(t):
                 restos.append(p)               # resto égaré dans une catégorie visite
             elif t & _BAR_TYPES:
                 bars.append(p)
@@ -221,6 +244,10 @@ def optimize_walking_order(stops, start=0):
 # à chaque lieu. Plus c'est haut, plus il faut d'avis pour que la note propre
 # du lieu s'impose. Réglable sans toucher au code.
 BAYES_M = float(os.environ.get("ITINERARY_QUALITY_PRIOR", 300))
+# Poids du boost Wikipédia : un lieu relié à un article consulté est un
+# incontournable. facteur = (1 + log10(1 + vues_mensuelles)) ** ALPHA.
+# 0 = désactivé. Ne s'applique qu'aux lieux enrichis (visites, jamais restos).
+WIKI_ALPHA = float(os.environ.get("ITINERARY_WIKI_BOOST", 0.3))
 
 
 def _rating(p):
@@ -232,7 +259,7 @@ def _rating(p):
 
 
 def _top(places, k=None):
-    """Classement QUALITÉ (note bayésienne façon IMDb), pas volume brut.
+    """Classement QUALITÉ (note bayésienne façon IMDb) x POPULARITÉ Wikipédia.
 
     Pourquoi : le nombre d'avis mesure le PASSAGE, pas l'intérêt — un
     supermarché ou un McDo cumule des milliers d'avis de locaux. La note
@@ -242,6 +269,10 @@ def _top(places, k=None):
     tout en restant prudente sur les lieux à 3 avis 5 étoiles.
     Le prior C est PONDÉRÉ par le volume d'avis : la note moyenne réellement
     observée sur le terrain, insensible aux micro-échantillons flatteurs.
+    Si le lieu est relié à un article Wikipédia (cf. enrichissement dans
+    place_explorer), le score est multiplié par
+    (1 + log10(1 + vues mensuelles)) ** WIKI_ALPHA : les incontournables
+    « au sens de la curation humaine » passent devant.
     Égalité départagée par le volume d'avis (le plus connu d'abord)."""
     num = sum((_rating(p) or 0) * (p.get("Total Reviews", 0) or 0)
               for p in places if _rating(p) is not None)
@@ -254,7 +285,11 @@ def _top(places, k=None):
         r = _rating(p)
         if r is None:
             r, v = prior, 0
-        return (v * r + BAYES_M * prior) / (v + BAYES_M)
+        base = (v * r + BAYES_M * prior) / (v + BAYES_M)
+        if WIKI_ALPHA and p.get("WikiTitle"):
+            views = p.get("WikiViews") or 0
+            base *= (1.0 + math.log10(1 + views)) ** WIKI_ALPHA
+        return base
 
     r = sorted(places, key=lambda p: (score(p), p.get("Total Reviews", 0) or 0),
                reverse=True)
@@ -813,8 +848,12 @@ def itinerary_plain_block(itin):
         addr = _addr(s)
         if addr:
             lines.append(f"       {addr}")
+        if s.get("Fermeture"):
+            lines.append(f"       ⚠ Fermé : {s['Fermeture']}")
         lines.append(f"       Maps : {place_url(s)}")
         lines.append(f"       Street View : {streetview_url(s)}")
+        if s.get("WikiUrl"):
+            lines.append(f"       Wikipédia : {s['WikiUrl']}")
     lines += ["", f"    Ouvrir tout l'itinéraire dans Google Maps : {itin['url']}", ""]
     return "\n".join(lines)
 
@@ -833,7 +872,20 @@ def itinerary_email_block(itin):
             sub.append(f'<span style="font-size:12px;color:{MUTED};">{meta}</span>')
         if addr:
             sub.append(f'<span style="font-size:11.5px;color:{MUTED};">\U0001f4cd {addr}</span>')
+        if s.get("Fermeture"):
+            sub.append(f'<span style="font-size:11.5px;color:#b45309;font-weight:600;">'
+                       f'\u26a0\ufe0f Fermé : {s["Fermeture"]}</span>')
         sub_html = ("<br>" + "<br>".join(sub)) if sub else ""
+        btn = ('display:inline-block;background:#eef2f8;color:%s;padding:7px 13px;'
+               'border-radius:6px;text-decoration:none;font-weight:600;font-size:12px;'
+               'border:1px solid #d7e0ec;' % NAVY)
+        buttons = (f'<a href="{place_url(s)}" target="_blank" '
+                   f'style="{btn}margin-right:6px;">Maps</a>'
+                   f'<a href="{streetview_url(s)}" target="_blank" '
+                   f'style="{btn}">Street View</a>')
+        if s.get("WikiUrl"):
+            buttons += (f'<a href="{s["WikiUrl"]}" target="_blank" '
+                        f'style="{btn}margin-left:6px;">Wikipédia</a>')
         rows.append(
             f'<tr><td style="padding:9px 0;border-bottom:1px solid #e6edf5;">'
             f'<table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr>'
@@ -841,14 +893,7 @@ def itinerary_email_block(itin):
             f'<strong>{i}.</strong> {s.get("_step","")} <strong>{s.get("Name","")}</strong>'
             f'{sub_html}</td>'
             f'<td align="right" style="vertical-align:middle;white-space:nowrap;padding-left:10px;">'
-            f'<a href="{place_url(s)}" target="_blank" '
-            f'style="display:inline-block;background:#eef2f8;color:{NAVY};padding:7px 13px;'
-            f'border-radius:6px;text-decoration:none;font-weight:600;font-size:12px;'
-            f'border:1px solid #d7e0ec;margin-right:6px;">Maps</a>'
-            f'<a href="{streetview_url(s)}" target="_blank" '
-            f'style="display:inline-block;background:#eef2f8;color:{NAVY};padding:7px 13px;'
-            f'border-radius:6px;text-decoration:none;font-weight:600;font-size:12px;'
-            f'border:1px solid #d7e0ec;">Street View</a></td>'
+            f'{buttons}</td>'
             f'</tr></table></td></tr>'
         )
     steps = "".join(rows)
