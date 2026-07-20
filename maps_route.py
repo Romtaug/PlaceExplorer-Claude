@@ -8,9 +8,9 @@ Logique :
     hôtel, camping, pharmacie... écartés quel que soit le pays ; site
     touristique taggé = toujours gardé, primaryType inclus), nom de l'enseigne
     (filet de secours), et statut (lieux fermés exclus) ;
-  - CLASSEMENT : note bayésienne (qualité) x boost Wikipédia (popularité
-    réelle, vues mensuelles de l'article) - un lieu de passage très fréquenté
-    ne bat plus une pépite, et les incontournables reconnus passent devant ;
+  - CLASSEMENT : popularité pure (nombre d'avis Google décroissant) - les
+    incontournables sont mécaniquement en tête, les filtres anti-parasites
+    ayant fait le ménage en amont ;
   - AVERTISSEMENTS : jours de fermeture hebdo affichés sur chaque étape ;
   - ordre optimisé pour minimiser la marche (nearest-neighbor + 2-opt, comme
     thermodata_engine) ;
@@ -99,6 +99,10 @@ EXCLUDE_TYPES = {
     "real_estate_agency", "lawyer", "accounting", "post_office", "police",
     "courthouse", "embassy", "local_government_office", "storage",
     "moving_company", "funeral_home", "beauty_salon", "hair_care", "laundry",
+    # bien-être commercial (un salon de massage n'est pas une visite ; les
+    # grands bains historiques type Széchenyi survivent via leur type fort)
+    "massage", "sauna", "wellness_center", "nail_salon", "tanning_studio",
+    "hair_salon", "barber_shop", "yoga_studio", "makeup_artist",
     # éducation & sport du quotidien
     "school", "primary_school", "secondary_school", "university", "gym",
     "fitness_center",
@@ -112,7 +116,9 @@ EXCLUDE_TYPES = {
 #     La règle suffixe attrape les dizaines de types New '*_restaurant'
 #     (pizza_restaurant, seafood_restaurant, fast_food_restaurant...).
 _FOOD_TYPES = {"restaurant", "cafe", "coffee_shop", "cafeteria", "bakery",
-               "meal_takeaway", "meal_delivery", "sandwich_shop"}
+               "meal_takeaway", "meal_delivery", "sandwich_shop",
+               "ice_cream_shop", "dessert_shop", "dessert_restaurant",
+               "chocolate_shop", "candy_store", "confectionery"}
 _BAR_TYPES = {"bar", "night_club", "pub", "wine_bar"}
 
 
@@ -148,13 +154,18 @@ def _is_open(p):
     return (p.get("BusinessStatus") or "OPERATIONAL") == "OPERATIONAL"
 
 
-def _classify(places_by_category):
+def _classify(places_by_category, report=False):
     """Répartit les lieux en (visites, restos, bars) pour l'itinéraire,
-    en appliquant les quatre filets ci-dessus. L'Excel n'est pas concerné."""
+    en appliquant les quatre filets ci-dessus. L'Excel n'est pas concerné.
+    report=True imprime un bilan des exclusions (diagnostic)."""
     visits, restos, bars = [], [], []
+    excl = {"statut": [], "catégorie": [], "type": [], "enseigne": []}
     for cat, places in places_by_category.items():
         for p in places:
-            if not _coords(p) or not _is_open(p):
+            if not _coords(p):
+                continue
+            if not _is_open(p):
+                excl["statut"].append(p.get("Name", "?"))
                 continue
             if cat in FOOD_CATEGORIES:
                 restos.append(p)
@@ -163,20 +174,29 @@ def _classify(places_by_category):
                 bars.append(p)
                 continue
             if cat in NON_TOURIST_CATS:
+                excl["catégorie"].append(p.get("Name", "?"))
                 continue
             t = set(p.get("Types") or [])
             if p.get("PrimaryType"):
                 t.add(p["PrimaryType"])       # le type dominant compte aussi
             if t & STRONG_TOURIST_TYPES:      # un vrai site l'emporte toujours
                 visits.append(p)
-            elif (t & EXCLUDE_TYPES) or _is_non_tourist_name(p):
-                continue                       # quotidien / service / enseigne
+            elif t & EXCLUDE_TYPES:
+                excl["type"].append(p.get("Name", "?"))
+            elif _is_non_tourist_name(p):
+                excl["enseigne"].append(p.get("Name", "?"))
             elif _is_food_type(t):
                 restos.append(p)               # resto égaré dans une catégorie visite
             elif t & _BAR_TYPES:
                 bars.append(p)
             else:
                 visits.append(p)               # neutre : bénéfice du doute
+    if report:
+        for reason, names in excl.items():
+            if names:
+                uniq = list(dict.fromkeys(names))
+                ex = ", ".join(uniq[:4]) + ("…" if len(uniq) > 4 else "")
+                print(f"   🚫 Exclus du parcours ({reason}) : {len(uniq)} - {ex}")
     return visits, restos, bars
 
 
@@ -240,16 +260,6 @@ def optimize_walking_order(stops, start=0):
 
 
 # ── Sélection ─────────────────────────────────────────────────────
-# Poids du prior bayésien : nombre d'avis "fictifs" à la moyenne locale ajoutés
-# à chaque lieu. Plus c'est haut, plus il faut d'avis pour que la note propre
-# du lieu s'impose. Réglable sans toucher au code.
-BAYES_M_ENV = os.environ.get("ITINERARY_QUALITY_PRIOR")   # vide = adaptatif
-# Poids du boost Wikipédia : un lieu relié à un article consulté est un
-# incontournable. facteur = (1 + log10(1 + vues_mensuelles)) ** ALPHA.
-# 0 = désactivé. Ne s'applique qu'aux lieux enrichis (visites, jamais restos).
-WIKI_ALPHA = float(os.environ.get("ITINERARY_WIKI_BOOST", 0.3))
-
-
 def _rating(p):
     r = p.get("Rating (on 5)")
     try:
@@ -258,57 +268,16 @@ def _rating(p):
         return None                      # 'Not rated' ou absent
 
 
-def _bayes_m(places):
-    """Poids m du prior : ADAPTATIF par défaut = médiane du volume d'avis du
-    pool (bornée 50-400). Un m fixe élevé écrase les pépites des petites
-    villes ; la médiane locale calibre automatiquement la confiance selon la
-    densité d'avis de la destination. ITINERARY_QUALITY_PRIOR force une valeur."""
-    if BAYES_M_ENV:
-        return float(BAYES_M_ENV)
-    counts = sorted((p.get("Total Reviews", 0) or 0) for p in places
-                    if (p.get("Total Reviews", 0) or 0) > 0)
-    if not counts:
-        return 100.0
-    med = counts[len(counts) // 2]
-    return float(min(400, max(50, med)))
-
-
 def _top(places, k=None):
-    """Classement QUALITÉ (note bayésienne façon IMDb) x POPULARITÉ Wikipédia.
-
-    Pourquoi : le nombre d'avis mesure le PASSAGE, pas l'intérêt — un
-    supermarché ou un McDo cumule des milliers d'avis de locaux. La note
-    bayésienne  score = (v·R + m·C) / (v + m)  (v = nb d'avis du lieu,
-    R = sa note, C = note moyenne du pool, m = BAYES_M) fait remonter les
-    pépites très bien notées et retient les gros volumes moyennement notés,
-    tout en restant prudente sur les lieux à 3 avis 5 étoiles.
-    Le prior C est PONDÉRÉ par le volume d'avis : la note moyenne réellement
-    observée sur le terrain, insensible aux micro-échantillons flatteurs.
-    Si le lieu est relié à un article Wikipédia (cf. enrichissement dans
-    place_explorer), le score est multiplié par
-    (1 + log10(1 + vues mensuelles)) ** WIKI_ALPHA : les incontournables
-    « au sens de la curation humaine » passent devant.
-    Égalité départagée par le volume d'avis (le plus connu d'abord)."""
-    num = sum((_rating(p) or 0) * (p.get("Total Reviews", 0) or 0)
-              for p in places if _rating(p) is not None)
-    den = sum((p.get("Total Reviews", 0) or 0)
-              for p in places if _rating(p) is not None)
-    prior = (num / den) if den else 4.2
-    m = _bayes_m(places)
-
-    def score(p):
-        v = p.get("Total Reviews", 0) or 0
-        r = _rating(p)
-        if r is None:
-            r, v = prior, 0
-        base = (v * r + m * prior) / (v + m)
-        if WIKI_ALPHA and p.get("WikiTitle"):
-            views = p.get("WikiViews") or 0
-            base *= (1.0 + math.log10(1 + views)) ** WIKI_ALPHA
-        return base
-
-    r = sorted(places, key=lambda p: (score(p), p.get("Total Reviews", 0) or 0),
-               reverse=True)
+    """Classement = POPULARITÉ PURE : nombre d'avis Google décroissant
+    (égalité départagée par la note). Choix produit assumé : le volume d'avis
+    est le meilleur proxy de « ce que les gens visitent vraiment ». Les
+    filtres anti-parasites (catégories, types Google, enseignes, statut) font
+    le ménage EN AMONT ; le classement n'a plus qu'à refléter la popularité,
+    ce qui met mécaniquement les incontournables en tête (Citadelle : 12 066
+    avis) sans qu'aucun réglage puisse les faire disparaître."""
+    r = sorted(places, key=lambda p: ((p.get("Total Reviews", 0) or 0),
+                                      _rating(p) or 0.0), reverse=True)
     return r[:k] if k else r
 
 
@@ -345,9 +314,9 @@ def _visit_minutes(p):
 
 
 def _fit_time_budget(scored_visits, cap, budget_min):
-    """Prend les visites TRIÉES PAR SCORE et renvoie (ordre_de_marche,
+    """Prend les visites TRIÉES PAR POPULARITÉ et renvoie (ordre_de_marche,
     minutes_de_visites, minutes_de_marche) pour la plus grande sélection
-    top-k (k <= cap) qui tient dans le budget. Glouton par la qualité :
+    top-k (k <= cap) qui tient dans le budget. Glouton par la popularité :
     exactement l'heuristique recommandée face au problème d'orienteering,
     sans solveur. Plancher à 3 visites pour ne jamais rendre un parcours vide."""
     n = min(cap, len(scored_visits))
@@ -496,7 +465,7 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS,
     le parcours se centre dessus -> fiable même si Google a ramené des lieux
     d'une autre ville. Sinon, on retombe sur la zone la plus dense des résultats.
     """
-    visits, restos, bars = _classify(places_by_category)
+    visits, restos, bars = _classify(places_by_category, report=True)
 
     # Garde-fou : on retire du parcours à pied les lieux trop loin du cœur.
     # L'Excel, lui, garde tout — ce filtre n'agit que sur l'itinéraire.
@@ -550,6 +519,13 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS,
     visits = _top(visits)
     if len(visits) < 2:
         return None
+
+    # Diagnostic : le haut du classement popularité, tel que le parcours le voit.
+    print("   🏆 Top candidats visites (avis / note ★) :")
+    for i, p in enumerate(visits[:12], 1):
+        wiki = " / wiki ✓" if p.get("WikiTitle") else ""
+        print(f"      {i:>2}. {p.get('Name','?')} "
+              f"({p.get('Total Reviews',0)} avis / {p.get('Rating (on 5)','?')}★{wiki})")
 
     # `visits` sort de _top déjà trié qualité. Sélection par BUDGET-TEMPS :
     # autant de visites du haut du classement que la journée peut en contenir
@@ -652,11 +628,9 @@ def _order_by_proximity(centroids, anchor):
 
 
 def _nearest_unused(places, center, used, k):
-    """k lieux pour le jour, non déjà utilisés : la QUALITÉ dans la ZONE.
-    On prend d'abord les candidats les plus proches du centre du jour (pool de
-    proximité), puis on garde les MEILLEURS au score bayésien. Le déjeuner du
-    jour 2 est ainsi le meilleur resto de sa zone, pas juste le plus proche
-    (qui peut être un kebab à 3,6 quand un 4,7 est à 200 m de plus)."""
+    """k lieux pour le jour, non déjà utilisés : les PLUS POPULAIRES de la
+    ZONE. On prend d'abord les candidats les plus proches du centre du jour
+    (pool de proximité), puis on garde les plus populaires (nb d'avis)."""
     cand = [p for p in places
             if (p.get("PlaceID") or id(p)) not in used and _coords(p)]
     cand.sort(key=lambda p: hav(center[0], center[1], *_coords(p)))
@@ -709,7 +683,7 @@ def build_multiday_plan(places_by_category, days, anchor=None,
         day_visits = [pool[i] for i in range(len(pool)) if assign[i] == c]
         if not day_visits:
             continue
-        # Départ du jour = meilleur lieu (qualité) de la zone, puis budget-temps :
+        # Départ du jour = lieu le plus populaire de la zone, puis budget-temps :
         # on trie la zone par score et on garde ce qui tient dans la journée.
         ranked = _top(day_visits)
         if DAY_BUDGET_MIN > 0:
