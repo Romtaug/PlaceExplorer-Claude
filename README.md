@@ -13,6 +13,7 @@ Image/logo.png
 Image/travel.png
 Image/qrcode.png
 place_explorer.py
+maps_route.py
 README.md
 ```
 
@@ -30,7 +31,15 @@ Repo → **Settings → Secrets and variables → Actions → New repository sec
 - Clé API : https://console.cloud.google.com/ → API et services → Identifiants
 - App Password : https://myaccount.google.com/apppasswords
 
-### 3. Lancer
+### 3. Activer "Places API (New)" (obligatoire, 2 minutes)
+Le script utilise la **nouvelle** API Places de Google (1 appel par catégorie au lieu de ~21) :
+1. https://console.cloud.google.com/ → ton projet → **API et services → Bibliothèque**
+2. Cherche **"Places API (New)"** → **Activer** (attention : c'est une API distincte de l'ancienne "Places API", les deux coexistent dans la bibliothèque)
+3. Si ta clé a des restrictions d'API (page **Identifiants** → ta clé → *API restrictions*), ajoute **Places API (New)** à la liste autorisée (garde aussi Geocoding, Directions et Static Maps, toujours utilisées)
+
+L'enrichissement **Wikipédia** (article + popularité, boost des incontournables dans le parcours) est 100% gratuit et **sans clé** — rien à faire. Désactivable avec la variable `WIKI_ENRICH=0`.
+
+### 4. Lancer
 Onglet **Actions → 🌍 Place Explorer → Run workflow** :
 - **location** : `Lisbonne, Portugal` (format `Ville, Pays` ou `Pays`)
 - **vacation_month** : `Août, 2026`
@@ -44,4 +53,4 @@ Le mail part avec l'Excel en pièce jointe, et l'Excel est aussi disponible en *
 - Mêmes liens qu'avant (Skyscanner, Rome2Rio, Airbnb, Booking, Revolut parrainage, BordEuro...)
 
 ## ⏱ Durée et quota
-31 catégories × ~21 requêtes ≈ **650 appels API Places par run** (~5-10 min). Surveille ton quota/facturation GCP.
+32 catégories × **1 requête Text Search (New)** ≈ **32 appels API par run** (~1-2 min), soit ~20× moins que l'ancienne version : un usage personnel reste dans le palier gratuit mensuel du SKU. L'enrichissement Wikipédia ajoute ~80 requêtes gratuites (API Wikimedia, sans clé).
