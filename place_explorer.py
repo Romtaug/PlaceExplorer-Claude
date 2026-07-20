@@ -172,6 +172,11 @@ def search_places(api_key, location, category):
         place_id = place.get('place_id')
         if not place_id:
             continue
+        # Lieu fermé définitivement : on ne le met nulle part (ni Excel, ni
+        # itinéraire) et on économise l'appel details.
+        if place.get('business_status') == 'CLOSED_PERMANENTLY':
+            print(f"   ⏭️ Fermé définitivement, ignoré : {place.get('name', place_id)}")
+            continue
         details = get_place_details(place_id, api_key)
         if details:
             full_address = details.get('formatted_address', 'Not specified')
@@ -191,6 +196,13 @@ def search_places(api_key, location, category):
                 'Lng': (details.get('geometry') or {}).get('location', {}).get('lng'),
                 'Country': country_long,
                 'CountryCode': country_short,
+                # Classification machine de Google (ex. ['supermarket','store']) :
+                # déjà présente dans la réponse textsearch, GRATUITE, et valable
+                # dans tous les pays. C'est elle qui permet à l'itinéraire de
+                # distinguer un vrai site d'un Super U / camping / pharmacie,
+                # quelle que soit la langue ou l'enseigne locale.
+                'Types': place.get('types') or [],
+                'BusinessStatus': place.get('business_status', ''),
             })
         time.sleep(0.05)
     return detailed_places
@@ -368,6 +380,10 @@ def filter_by_country(places_by_category, location):
 
 
 CATEGORIES = {
+    # La requête reine : les incontournables au sens de Google. Alimente une
+    # feuille dédiée en tête d'Excel ET enrichit le pool de l'itinéraire avec
+    # exactement ce qu'on cherche (au lieu de le reconstituer par ricochet).
+    'attractions': '🎯 Incontournables',
     # Découvertes
     'historical_sites': '🏰 Sites historiques',
     'museums': '🖼️ Musées',
@@ -445,7 +461,8 @@ def create_excel_file(api_key, location, vacation_month):
         description = CATEGORIES[category]
         df = pd.DataFrame(data).sort_values(by='Total Reviews', ascending=False)
         df = df.drop(columns=['PlaceID', 'Lat', 'Lng', '_category',
-                              'Country', 'CountryCode'], errors='ignore')
+                              'Country', 'CountryCode', 'Types', 'BusinessStatus'],
+                     errors='ignore')
         sheet_name = description if len(description) <= 31 else description[:31]
         df.to_excel(writer, sheet_name=sheet_name, index=False)
     writer.close()
