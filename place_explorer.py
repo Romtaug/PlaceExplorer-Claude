@@ -713,11 +713,64 @@ def create_multiday_excel(plan, location, vacation_month, script_dir):
 def build_email_bodies(location, location_cleaned, vacation_month_cleaned, itinerary_block="", itinerary_plain=""):
     ia_prompt = (
         f"Je prépare un voyage : {location}, en {vacation_month_cleaned.replace('-', ' ')}. "
-        "Fais-moi un top 20 des incontournables sur cette période (événements et activités), "
-        "un top 10 des villes ou quartiers à visiter autour avec le temps de trajet, et indique "
-        "les démarches administratives nécessaires (documents, visas, vaccins), les précautions à "
-        "prendre (arnaques, numéros d'urgence), les coûts approximatifs, la météo moyenne, les "
-        "événements locaux, et des astuces pour se déplacer, respecter les coutumes et profiter au maximum."
+        "J'ai DÉJÀ un guide Excel des meilleurs lieux classés par catégorie "
+        "(monuments, plages, restaurants, musées...) : ne refais pas cette liste. "
+        "Ta mission : la COMPLÉTER avec tout ce qu'un fichier statique ne peut pas "
+        "donner, en faisant de VRAIES recherches web au moment où tu lis ceci, et "
+        "livrer le résultat en ARTEFACT HTML. "
+        "RECHERCHES (obligatoire) : croise au moins deux sources par information ; "
+        "priorise l'office de tourisme et les sites officiels (mairie, billetteries, "
+        "transporteurs, sites des lieux eux-mêmes) ; vérifie que chaque date tombe "
+        "bien pendant mon séjour : rien de passé, rien de générique ni "
+        "d'intemporel ; si une info (date, prix, horaire, dispo) n'est pas sûre, "
+        "dis-le explicitement. "
+        "CONTENU À COUVRIR : "
+        "1) L'AGENDA du séjour : festivals, concerts, fêtes locales et de village, "
+        "marchés (nocturnes inclus), expositions temporaires, événements sportifs : "
+        "8 à 15 recommandations classées de la meilleure à la moins prioritaire, "
+        "avec 2-3 coups de coeur mis en avant ; pour chacune : titre, date et "
+        "horaire précis, lieu, prix approximatif, l'ambiance qui lui va (solo, "
+        "couple, famille, amis), 2-3 phrases concrètes qui donnent envie, et un "
+        "lien officiel ou de billetterie. "
+        "2) EXCURSIONS : top 10 des villages, villes ou sites naturels autour, avec "
+        "temps de trajet réaliste depuis ma base, le meilleur moyen d'y aller, et "
+        "ce qui vaut vraiment le détour sur place. "
+        "3) PRATIQUE : comment y aller et se déplacer sur place (options, pièges du "
+        "type parking ou navette ou réservation obligatoire), budget réaliste par "
+        "poste (repas, activités, transports) pour la période, météo normale du "
+        "mois et quoi mettre dans la valise, affluence attendue et conseils de "
+        "réservation, documents nécessaires, numéros d'urgence, arnaques courantes, "
+        "santé. "
+        "4) GASTRONOMIE et COUTUMES : spécialités locales à goûter avec 3 à 5 "
+        "adresses vérifiées, usages locaux et astuces pour profiter comme un "
+        "habitant. "
+        "ARTEFACT HTML (contraintes techniques obligatoires) : un SEUL fichier HTML "
+        "autonome, CSS en ligne, AUCUN script, AUCUNE ressource externe (ni iframe, "
+        "ni police, ni image distante, ni localStorage). Échappe TOUTES les "
+        "esperluettes en entité HTML, dans les URL comme dans les textes. Liens "
+        "complets en https, guillemets droits pour les attributs, target blank. "
+        "Structure : en-tête résumant le séjour, section Agenda en cartes (badge "
+        "pour les coups de coeur, date et horaire, lieu, prix, bouton vers le lien "
+        "officiel, bouton Itinéraire au format officiel Google Maps api=1 en "
+        "échappant chaque esperluette), section Excursions avec temps de trajet, "
+        "puis les sections pratiques compactes en tableaux. "
+        "TERMINE l'artefact par une rangée de 4 boutons cliquables pour rebondir : "
+        "'Agenda semaine par semaine', 'Excursions et villages', 'Budget et bons "
+        "plans', 'Gastronomie locale' : chaque bouton est un lien https vers "
+        "claude.ai/new avec le paramètre q contenant une nouvelle recherche ciblée "
+        "qui rappelle la destination et la période. "
+        "VÉRIFICATION DES LIENS : chaque lien pointe vers une page officielle qui "
+        "existe réellement, vérifiée par une recherche web ; ne devine jamais une "
+        "URL. "
+        "DOUBLE VÉRIFICATION AVANT DE LIVRER (indique le résultat en une seule "
+        "ligne) : 1) balises html, head, style et body équilibrées ; 2) zéro "
+        "esperluette non échappée ; 3) tous les liens complets et vérifiés ; "
+        "4) aucun script ni ressource externe. Si un point échoue, corrige puis "
+        "re-vérifie avant de livrer. "
+        "SÉCURITÉ D'AFFICHAGE : fournis aussi le fichier téléchargeable en plus de "
+        "l'aperçu, et rappelle en une ligne : si l'aperçu reste blanc, basculer "
+        "entre la vue code et la vue aperçu, ou ouvrir le fichier dans le "
+        "navigateur. Reste concret, va droit au but."
     )
 
     import urllib.parse as _up
@@ -895,7 +948,7 @@ Accédez à notre outil pour travailler à l'étranger : https://bordeuroconnect
   <tr><td style="padding:26px 36px 8px;">
     {section_title('Assistant IA', 'Enrichissez votre expérience')}
     <p style="margin:0 0 12px;font-size:14px;color:{TEXT};line-height:1.6;">
-      Cliquez sur le bouton ci-dessous&nbsp;: <strong>Claude</strong> s'ouvre avec ce prompt déjà saisi, il ne reste qu'à appuyer sur Entrée pour obtenir un programme complet et personnalisé&nbsp;:
+      Cliquez sur le bouton ci-dessous&nbsp;: <strong>Claude</strong> s'ouvre avec ce prompt déjà saisi, il ne reste qu'à appuyer sur Entrée. Il fait alors de vraies recherches web du moment et livre le complément vivant de votre Excel&nbsp;: agenda daté du séjour, excursions, budget, météo et conseils, en page HTML interactive&nbsp;:
     </p>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color:#f8f9fa;border-left:4px solid {NAVY};border-radius:0 8px 8px 0;">
       <tr><td style="padding:16px 18px;">
