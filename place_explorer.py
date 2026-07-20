@@ -201,22 +201,30 @@ def _parse_new_place(pl):
 
 
 def geocode_location(location, api_key):
-    """Coordonnées (lat, lng) de la ville saisie par l'utilisateur, via l'API
-    Geocoding. Sert d'ancre FIABLE pour l'itinéraire : on se centre sur la ville
-    DEMANDÉE, pas sur le lieu le plus visité parmi les résultats (qui peut être
-    dans une autre ville si Google élargit la recherche pour une catégorie
-    absente localement, ex. Šiauliai -> Klaipėda). Renvoie None si échec."""
+    """Coordonnées (lat, lng) de la ville saisie par l'utilisateur, via Places
+    API (New) searchText (l'API Geocoding classique n'est pas activable sur les
+    projets GCP récents). Sert d'ancre FIABLE pour l'itinéraire : on se centre
+    sur la ville DEMANDÉE, pas sur le lieu le plus visité parmi les résultats
+    (qui peut être dans une autre ville si Google élargit la recherche pour une
+    catégorie absente localement, ex. Šiauliai -> Klaipėda). None si échec."""
     try:
-        r = requests.get("https://maps.googleapis.com/maps/api/geocode/json",
-                         params={"address": location, "language": "en", "key": api_key},
-                         timeout=30)
-        data = r.json()
-        if data.get("status") == "OK" and data.get("results"):
-            loc = data["results"][0]["geometry"]["location"]
-            return (loc["lat"], loc["lng"])
-        print(f"⚠️ Geocoding '{location}' : statut {data.get('status')}")
+        r = requests.post(
+            "https://places.googleapis.com/v1/places:searchText",
+            json={"textQuery": location, "languageCode": "fr", "pageSize": 1},
+            headers={"Content-Type": "application/json",
+                     "X-Goog-Api-Key": api_key,
+                     "X-Goog-FieldMask": "places.location"},
+            timeout=30)
+        if r.status_code == 200:
+            places = (r.json() or {}).get("places", [])
+            if places and places[0].get("location"):
+                loc = places[0]["location"]
+                return (loc["latitude"], loc["longitude"])
+            print(f"⚠️ Ancre '{location}' : aucun résultat searchText")
+        else:
+            print(f"⚠️ Ancre '{location}' : erreur {r.status_code}")
     except Exception as e:
-        print(f"⚠️ Geocoding erreur : {e}")
+        print(f"⚠️ Ancre erreur : {e}")
     return None
 
 
