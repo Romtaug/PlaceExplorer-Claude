@@ -39,6 +39,8 @@ Le script utilise la **nouvelle** API Places de Google (1 appel par catégorie a
 
 L'enrichissement **Wikipédia** (article + popularité, boost des incontournables dans le parcours) est 100% gratuit et **sans clé** — rien à faire. Désactivable avec la variable `WIKI_ENRICH=0`.
 
+Notes projets GCP récents (créés après mars 2025) : les API legacy (Geocoding web classique, Directions) n'y sont pas activables — le script n'en dépend plus (ancre via Places New, temps de marche estimé en interne). Optionnel : activer **"Maps Static API"** (API actuelle) pour retrouver l'image de carte du parcours dans le mail.
+
 ### 4. Lancer
 Onglet **Actions → 🌍 Place Explorer → Run workflow** :
 - **location** : `Lisbonne, Portugal` (format `Ville, Pays` ou `Pays`)
