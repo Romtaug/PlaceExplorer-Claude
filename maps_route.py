@@ -468,41 +468,20 @@ def build_route_url(stops, travelmode="walking"):
     return url
 
 
-# ── Distance + temps + tracé RÉELS via Directions API (1 appel) ───
-def walking_distance_time(stops, api_key):
-    """Retourne (distance_m, duree_s, polyline_encodee) réels à pied,
-    ou (None, None, None) si échec."""
+# ── Distance + temps de marche : ESTIMATION INTERNE (0 appel API) ─
+def walking_distance_time(stops, api_key=None):
+    """Retourne (distance_m, duree_s, polyline) estimés à pied.
+    Distance haversine cumulée x facteur détour rues, à vitesse piéton :
+    cohérent avec le budget-temps de la journée, gratuit, et sans dépendance
+    à l'API Directions legacy (non activable sur les projets GCP récents).
+    api_key conservé pour compatibilité. Pas de polyline : la carte statique
+    relie les points en segments droits."""
     stops = [s for s in stops if _coords(s)]
-    if len(stops) < 2 or not api_key:
+    if len(stops) < 2:
         return None, None, None
-
-    def ref(s):
-        return f"place_id:{s['PlaceID']}" if s.get("PlaceID") else f"{s['Lat']},{s['Lng']}"
-
-    params = {
-        "origin": ref(stops[0]),
-        "destination": ref(stops[-1]),
-        "mode": "walking",
-        "key": api_key,
-    }
-    if len(stops) > 2:
-        params["waypoints"] = "|".join(ref(s) for s in stops[1:-1])
-    try:
-        r = requests.get("https://maps.googleapis.com/maps/api/directions/json",
-                         params=params, timeout=30)
-        data = r.json()
-        if data.get("status") != "OK" or not data.get("routes"):
-            print(f"⚠️ Directions API : {data.get('status')} {data.get('error_message','')}")
-            return None, None, None
-        route = data["routes"][0]
-        legs = route["legs"]
-        dist = sum(l["distance"]["value"] for l in legs)
-        dur = sum(l["duration"]["value"] for l in legs)
-        poly = (route.get("overview_polyline") or {}).get("points")
-        return dist, dur, poly
-    except Exception as e:
-        print(f"⚠️ Directions API erreur : {e}")
-        return None, None, None
+    dist = int(_route_len(stops) * _DETOUR)
+    dur = int(dist / 1000.0 / _WALK_KMH * 3600.0)
+    return dist, dur, None
 
 
 # ── Itinéraire d'une journée ──────────────────────────────────────
@@ -533,13 +512,14 @@ def build_day_itinerary(places_by_category, api_key=None, n_visits=N_VISITS,
     if anchor is None and MAX_KM_FROM_CORE:
         anchor = _densest_anchor(visits, MAX_KM_FROM_CORE)
 
-    # Rayon ADAPTATIF : on part d'un rayon de marche serré et on l'élargit par
-    # paliers UNIQUEMENT s'il manque de quoi remplir le parcours complet
-    # (10 visites + 2 restos + 1 bar = 13 étapes). Une grande ville (Vilnius)
-    # reste à ~5 km ; une petite ville (Šiauliai) s'élargit pour aller chercher
-    # de quoi compléter, sans dépasser le plafond (sinon on sauterait sur une
-    # autre ville). Réglable : ITINERARY_BASE_KM / ITINERARY_STEP_KM / ITINERARY_MAX_KM.
-    base_km = float(os.environ.get("ITINERARY_BASE_KM", MAX_KM_FROM_CORE or 30.0))
+    # Rayon ADAPTATIF : on part d'un rayon de marche serré (5 km) et on
+    # l'élargit par paliers UNIQUEMENT s'il manque de quoi remplir le parcours
+    # complet (10 visites + 2 restos + 1 bar = 13 étapes). Une grande ville
+    # (Vilnius) reste à ~5 km ; une petite ville (Šiauliai) s'élargit pour
+    # compléter, sans dépasser le plafond (sinon on sauterait sur une autre
+    # ville, ou un site à 25 km mangerait tout le budget-temps de la journée).
+    # Réglable : ITINERARY_BASE_KM / ITINERARY_STEP_KM / ITINERARY_MAX_KM.
+    base_km = float(os.environ.get("ITINERARY_BASE_KM", 5.0))
     step_km = float(os.environ.get("ITINERARY_STEP_KM", 5.0))
     max_km = float(os.environ.get("ITINERARY_MAX_KM", 30.0))
     want_v, want_r, want_b = n_visits, 2, 1
@@ -808,7 +788,9 @@ def download_static_map(itin, api_key, dest_path, size="640x400", scale=2):
             with open(dest_path, "wb") as f:
                 f.write(r.content)
             return True
-        print(f"⚠️ Static Maps : {r.status_code} {ctype} {r.text[:120]}")
+        print(f"⚠️ Carte statique indisponible ({r.status_code}) : le mail part "
+              f"sans image. Pour la réactiver : console GCP -> Bibliothèque -> "
+              f"activer 'Maps Static API' (API actuelle, non legacy).")
         return False
     except Exception as e:
         print(f"⚠️ Static Maps erreur : {e}")
